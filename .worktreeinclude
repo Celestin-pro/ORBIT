@@ -1,0 +1,4 @@
+# Fichiers ignorés par git que Claude Code copie dans chaque nouveau worktree d'agent.
+# Sans lui, cargo ne trouve ni FFmpeg ni SDL3 (les chemins pointent vers le third_party
+# du dépôt principal : pas de nouveau téléchargement par worktree).
+.cargo/config.toml

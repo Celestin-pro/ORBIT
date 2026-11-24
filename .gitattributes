@@ -1,0 +1,12 @@
+# Fins de ligne LF dans le dépôt et sur disque, quel que soit le réglage core.autocrlf :
+# évite les faux conflits entre agents/outils qui n'écrivent pas tous les mêmes fins de ligne.
+* text=auto eol=lf
+
+# Cargo.lock est régénéré par cargo : en cas de conflit, garder une version puis relancer
+# `cargo build` plutôt que de fusionner à la main.
+Cargo.lock linguist-generated=true
+
+*.dll binary
+*.lib binary
+*.exe binary
+*.png binary

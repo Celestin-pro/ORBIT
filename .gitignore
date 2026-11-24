@@ -1,0 +1,14 @@
+# Sorties de compilation (une par worktree)
+/target
+
+# Dépendances téléchargées par scripts/setup.ps1 (FFmpeg LGPL, SDL3)
+/third_party
+
+# Généré par scripts/setup.ps1 (chemins absolus propres à la machine)
+/.cargo/config.toml
+
+# Worktrees des agents (voir « Travail à plusieurs agents » dans CLAUDE.md)
+/.claude/worktrees/
+
+# Réglages Claude Code personnels
+/.claude/settings.local.json

@@ -1,0 +1,62 @@
+[package]
+name = "orbit-player"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Récepteur de streaming d'ORBIT : vidéo D3D11VA, entrées et son, en une seule fenêtre"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "orbit-player"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.6", features = ["derive"] }
+env_logger = "0.11"
+
+# crossbeam-channel (annoncé dans CLAUDE.md) sera ajouté quand un canal sera réellement
+# nécessaire : la boîte aux lettres vidéo est un Mutex+Condvar, et le thread vidéo se pilote
+# par un AtomicBool partagé avec le rappel d'interruption de FFmpeg.
+log = "0.4"
+thiserror = "2.0"
+
+# FFmpeg LGPL en DLL (règle 4 de CLAUDE.md) : bindings bruts, aucune compilation de FFmpeg
+# ici. La version majeure suit celle des DLL téléchargées par scripts/setup.ps1 (8.1), et
+# `FFMPEG_DIR` indique au build script où trouver en-têtes et .lib.
+# On ne prend que les bibliothèques utiles au chemin vidéo : pas de swscale (aucune
+# conversion logicielle), pas de swresample, pas d'avfilter ni d'avdevice.
+ffmpeg-sys-next = { version = "8.1", default-features = false, features = [
+    "avcodec",
+    "avformat",
+] }
+
+# SDL3 : fenêtre, clavier/souris, manette, son.
+# On lie le SDL3 précompilé officiel téléchargé par scripts/setup.ps1 dans
+# third_party/sdl3 ; le chemin de SDL3.lib est fourni par build.rs via SDL3_DIR.
+sdl3 = { version = "0.22", default-features = false }
+
+[dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D10",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "debuginfo"
+
+# Le décodage et la réception restent utilisables en profil de debug ;
+# on garde un minimum d'optimisation pour tenir le temps réel.
+[profile.dev]
+opt-level = 1

@@ -1,0 +1,3 @@
+# Le propriétaire du projet doit pouvoir lire le code : lignes larges, littéraux compacts.
+max_width = 100
+use_small_heuristics = "Max"
