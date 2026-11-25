@@ -364,10 +364,12 @@ fn dormir_en_surveillant(duree: Duration, arret: &AtomicBool) -> bool {
     !arret.load(Ordering::Relaxed)
 }
 
-/// Journal des paquets reçus : détail à la trace, résumé chiffré une fois par seconde.
+/// Journal des paquets reçus : détail à la trace, résumé chiffré une fois par seconde en
+/// débogage (`ORBIT_LOG=debug`).
 ///
-/// C'est le livrable observable de l'étape 2 : il doit permettre de constater, sans
-/// décodeur, qu'un flux arrive et à quel débit.
+/// C'était le livrable observable de l'étape 2 : constater, sans décodeur, qu'un flux arrive
+/// et à quel débit. Depuis l'étape 4, le résumé de référence est la ligne `stats | ...` du
+/// thread principal, identique à l'overlay F3.
 struct Journal {
     info: Option<StreamInfo>,
     debut_fenetre: Instant,
@@ -445,7 +447,10 @@ impl Journal {
 
         let suffixe = if motif.is_empty() { String::new() } else { format!(" [{motif}]") };
 
-        log::info!(
+        // Niveau debug : le résumé `stats | ...` du thread principal donne déjà cadence et
+        // débit une fois par seconde, avec les mêmes chiffres que l'overlay. Cette ligne
+        // garde le détail propre à la réception (taille moyenne, images clés, PTS).
+        log::debug!(
             "réception{suffixe} : {cadence:.1} paquets/s, {debit_mbit:.2} Mbit/s, \
              {taille_moyenne} octets/paquet en moyenne, {} image(s) clé, {}, total {} paquets",
             self.images_cles,

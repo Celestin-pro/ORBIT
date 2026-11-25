@@ -601,6 +601,26 @@ mod tests {
     }
 
     #[test]
+    fn overlay_et_journal_affichent_les_memes_chiffres() {
+        // C'est la promesse de l'étape 4 : une seule source, deux mises en forme. Chaque
+        // ligne de l'overlay doit se retrouver, libellé et valeur, dans la ligne du journal.
+        let lignes = lignes(&echantillon_type());
+        let overlay = texte_overlay(&lignes);
+        let journal = ligne_journal(&lignes);
+
+        assert_eq!(overlay.len(), lignes.len(), "une ligne d'overlay par mesure");
+        for ((libelle, valeur), affiche) in lignes.iter().zip(&overlay) {
+            assert!(affiche.starts_with(libelle.as_str()), "« {affiche} »");
+            assert!(affiche.ends_with(valeur.as_str()), "« {affiche} »");
+            assert!(
+                journal.contains(&format!("{libelle}={valeur}")),
+                "{libelle} absent du journal"
+            );
+        }
+        assert_eq!(journal.matches(" | ").count(), lignes.len() - 1);
+    }
+
+    #[test]
     fn le_journal_tient_sur_une_ligne() {
         let lignes = vec![
             ("Reçues".to_owned(), "60.0 img/s".to_owned()),
