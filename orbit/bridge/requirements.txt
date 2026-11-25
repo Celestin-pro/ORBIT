@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+zeroconf
+spake2
+pygame
+pynput
+sounddevice
