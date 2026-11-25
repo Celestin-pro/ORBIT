@@ -14,6 +14,9 @@
     udp (défaut) ou srt. En SRT, ce script est l'appelant (`mode=caller`) et le player
     l'auditeur, comme en production.
 
+.PARAMETER Codec
+    h264 (défaut) ou hevc. Le player doit décoder les deux en D3D11VA.
+
 .PARAMETER Encoder
     auto (défaut), ou un encodeur précis : h264_nvenc, hevc_nvenc, libopenh264, h264_amf,
     h264_qsv, h264_mf...
@@ -43,6 +46,9 @@ param(
     [string] $Target = '127.0.0.1',
 
     [int] $Port = 5000,
+
+    [ValidateSet('h264', 'hevc')]
+    [string] $Codec = 'h264',
 
     [string] $Encoder = 'auto',
 
@@ -126,8 +132,14 @@ function Test-Encodeur([string] $Nom) {
 $encodeursListes = (& $Ffmpeg -hide_banner -encoders | Out-String)
 
 if ($Encoder -eq 'auto') {
-    # Ordre de préférence : matériel NVIDIA (comme en production), puis logiciel LGPL.
-    $candidats = @('h264_nvenc', 'h264_qsv', 'h264_amf', 'h264_mf', 'libopenh264')
+    # Ordre de préférence : matériel NVIDIA (comme en production), puis les autres encodeurs
+    # matériels, puis le logiciel LGPL. Aucun encodeur GPL (x264/x265) n'est proposé.
+    $candidats = if ($Codec -eq 'hevc') {
+        @('hevc_nvenc', 'hevc_qsv', 'hevc_amf', 'hevc_mf', 'libkvazaar')
+    }
+    else {
+        @('h264_nvenc', 'h264_qsv', 'h264_amf', 'h264_mf', 'libopenh264')
+    }
     $Encoder = $null
     foreach ($candidat in $candidats) {
         if ($encodeursListes -notmatch [regex]::Escape($candidat)) { continue }
@@ -138,11 +150,12 @@ if ($Encoder -eq 'auto') {
         }
     }
     if (-not $Encoder) {
-        Write-Host 'Aucun encodeur H.264 utilisable dans ce build FFmpeg.' -ForegroundColor Red
-        Write-Host 'Rappel : x264 est GPL et donc exclu du projet (règle 4 de CLAUDE.md).'
+        Write-Host "Aucun encodeur $Codec utilisable dans ce build FFmpeg." -ForegroundColor Red
+        Write-Host 'Rappel : x264 et x265 sont GPL, donc exclus du projet (règle 4 de CLAUDE.md).'
         exit 1
     }
 }
+Write-Host "codec    : $Codec" -ForegroundColor Green
 Write-Host "encodeur : $Encoder" -ForegroundColor Green
 
 # ---------------------------------------------------------------------------
@@ -161,6 +174,10 @@ switch -Wildcard ($Encoder) {
     'libopenh264' {
         # Encodeur logiciel : une tranche par thread, pas de recherche de débit.
         $optionsEncodeur += @('-rc_mode', 'bitrate', '-slices', '0')
+    }
+    'libkvazaar' {
+        # HEVC logiciel (LGPL) : le plus rapide possible, sans réordonnancement.
+        $optionsEncodeur += @('-preset', 'ultrafast')
     }
     '*_qsv' { $optionsEncodeur += @('-preset', 'veryfast', '-low_delay_brc', '1') }
     '*_amf' { $optionsEncodeur += @('-usage', 'ultralowlatency', '-quality', 'speed') }
@@ -207,7 +224,9 @@ if ($Duration -gt 0) { Write-Host "durée       : $Duration s" }
 else { Write-Host 'durée       : illimitée (Ctrl+C pour arrêter)' }
 Write-Host ''
 Write-Host 'Côté player, attendu dans le journal :' -ForegroundColor DarkGray
-Write-Host "  « Entrée ouverte : $(if ($Transport -eq 'udp') { 'udp' } else { 'srt' })://0.0.0.0:$Port ... (H.264 $Size) »" -ForegroundColor DarkGray
+$nomCodec = if ($Codec -eq 'hevc') { 'HEVC' } else { 'H.264' }
+Write-Host "  « Entrée ouverte : ${Transport}://0.0.0.0:$Port ... ($nomCodec $Size) »" -ForegroundColor DarkGray
+Write-Host "  puis « Décodeur $nomCodec ouvert en D3D11VA » et « Pool NV12 alloué »." -ForegroundColor DarkGray
 Write-Host "  puis une ligne « réception : ... » par seconde, à environ $Rate paquets/s." -ForegroundColor DarkGray
 Write-Host ''
 

@@ -82,7 +82,14 @@ impl DecodeError {
 pub trait HwDecoder: Send {
     /// Prépare le décodeur pour le flux décrit. Appelé à l'ouverture, et de nouveau si la
     /// source annonce un changement de codec ou de résolution.
-    fn configure(&mut self, info: StreamInfo) -> Result<(), DecodeError>;
+    ///
+    /// `jeux_de_parametres` contient les SPS/PPS (et VPS en HEVC) au format Annex B, tels
+    /// que fournis par [`VideoSource::parameter_sets`]. Peut être vide si la source les
+    /// répète dans le flux.
+    ///
+    /// [`VideoSource::parameter_sets`]: crate::video::source::VideoSource::parameter_sets
+    fn configure(&mut self, info: StreamInfo, jeux_de_parametres: &[u8])
+    -> Result<(), DecodeError>;
 
     /// Décode une unité d'accès et publie dans `sortie` les images devenues disponibles
     /// (zéro, une, ou plusieurs).

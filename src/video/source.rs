@@ -115,6 +115,15 @@ pub trait VideoSource: Send {
     /// Caractéristiques du flux, dès qu'elles sont connues.
     fn stream_info(&self) -> Option<StreamInfo>;
 
+    /// Jeux de paramètres du flux, au format Annex B : SPS/PPS en H.264, VPS/SPS/PPS en
+    /// HEVC. Vide si la source n'en connaît pas.
+    ///
+    /// Le décodeur en a besoin pour démarrer : en MPEG-TS, ces unités sont normalement
+    /// répétées dans le flux, mais les premières sont consommées par l'analyse de l'entrée,
+    /// et tous les encodeurs ne les répètent pas. Les transmettre explicitement évite de
+    /// dépendre de ce comportement.
+    fn parameter_sets(&self) -> &[u8];
+
     /// Remplit `unite` avec la prochaine unité d'accès.
     ///
     /// Appel bloquant, borné par le délai d'attente interne de la source : renvoie

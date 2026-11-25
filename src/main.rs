@@ -1,9 +1,9 @@
 //! orbit-player : récepteur de streaming d'ORBIT.
 //!
-//! Étapes 1 et 2 de la v0.1 : fenêtre SDL3, device Direct3D 11 unique, chaîne d'échange
-//! « flip », boucle d'événements et touches réservées ; réception UDP/SRT du MPEG-TS dans un
-//! thread dédié, qui journalise les paquets reçus. Le décodage et l'overlay viennent aux
-//! étapes 3 et 4.
+//! v0.1, étapes 1 à 3 : fenêtre SDL3, device Direct3D 11 unique, chaîne d'échange « flip »,
+//! réception UDP/SRT du MPEG-TS, décodage D3D11VA sans copie CPU, et affichage NV12 -> RGB
+//! en respectant le ratio. L'overlay F3 et la reconnexion automatique viennent à l'étape 4 ;
+//! pour l'instant les mesures sont journalisées une fois par seconde.
 
 mod config;
 mod render;
@@ -14,16 +14,19 @@ mod video;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use sdl3::event::{Event, WindowEvent};
 use sdl3::keyboard::{Keycode, Mod, Scancode};
-use windows::Win32::Foundation::HWND;
 
 use crate::config::Config;
-use crate::render::d3d11::{Gpu, Presenter, RenderError};
+use crate::render::d3d11::{Gpu, Pipeline, Presenter, RenderError, hwnd_de};
 use crate::render::letterbox::{Viewport, letterbox};
+use crate::render::nv12::Nv12Pool;
 use crate::stats::{Cadence, Stats};
+use crate::video::avcodec_decoder::AvcodecD3d11Decoder;
+use crate::video::frame::{DecodedFrame, Mailbox, SlotIndex};
 use crate::video::lavf_source::LavfSource;
 use crate::video::thread::VideoThread;
 
@@ -36,6 +39,13 @@ const COULEUR_FOND: [f32; 4] = [0.02, 0.02, 0.03, 1.0];
 /// Délai maximal d'attente de la chaîne d'échange : au-delà, on repasse par la boucle
 /// d'événements pour rester réactif à la fermeture de la fenêtre.
 const ATTENTE_PRESENTATION_MS: u32 = 100;
+
+/// Délai maximal d'attente d'une nouvelle image décodée. Court, pour continuer à traiter les
+/// événements de la fenêtre même quand le flux est muet.
+const ATTENTE_IMAGE_MS: u64 = 8;
+
+/// Période du résumé des mesures dans le journal.
+const PERIODE_MESURES: Duration = Duration::from_secs(1);
 
 fn main() -> ExitCode {
     regler_console_en_utf8();
@@ -84,8 +94,12 @@ fn executer() -> Result<()> {
 
     let hwnd = hwnd_de(&fenetre).context("récupération du HWND de la fenêtre SDL3")?;
 
-    let gpu = Gpu::nouveau(debug_d3d).context("création du device Direct3D 11")?;
+    let gpu = Arc::new(Gpu::nouveau(debug_d3d).context("création du device Direct3D 11")?);
     log::debug!("Niveau de fonctionnalité Direct3D : {:#x}", gpu.niveau());
+
+    Nv12Pool::verifier_support_nv12(&gpu)
+        .context("cette carte graphique ne peut pas échantillonner du NV12")?;
+    let pipeline = Pipeline::nouveau(&gpu).context("compilation du pipeline NV12 -> RGB")?;
     let mut presenter = Presenter::nouveau(
         &gpu,
         hwnd,
@@ -101,7 +115,16 @@ fn executer() -> Result<()> {
     stats.enregistrer_resolution(1920, 1080);
     let mut cadence_presentation = Cadence::new(0);
 
-    // Thread vidéo : il ouvre l'entrée (ce qui peut bloquer) et journalise les paquets.
+    // Pool de textures NV12 + boîte aux lettres d'une place : c'est la frontière entre le
+    // thread vidéo (qui copie et publie) et ce thread (qui dessine et présente).
+    let boite = Arc::new(Mailbox::new());
+    let pool =
+        Arc::new(Nv12Pool::nouveau(Arc::clone(&gpu), Arc::clone(&boite), Arc::clone(&stats)));
+
+    let decodeur = AvcodecD3d11Decoder::nouveau(Arc::clone(&gpu))
+        .context("création du décodeur matériel D3D11VA")?;
+
+    // Thread vidéo : il ouvre l'entrée (ce qui peut bloquer), décode et publie.
     // Le drapeau d'arrêt sert aussi de rappel d'interruption à libavformat, ce qui rend la
     // fermeture immédiate même sur un socket silencieux.
     let arret_video = Arc::new(AtomicBool::new(false));
@@ -109,6 +132,8 @@ fn executer() -> Result<()> {
     let arret_source = Arc::clone(&arret_video);
     let thread_video = VideoThread::demarrer(
         move || LavfSource::ouvrir(&url_video, arret_source),
+        Box::new(decodeur),
+        Arc::clone(&pool) as Arc<dyn crate::video::decoder::FrameSink>,
         arret_video,
         Arc::clone(&stats),
     )
@@ -120,6 +145,12 @@ fn executer() -> Result<()> {
         .context("création de la pompe d'événements")?;
     let mut overlay_visible = false;
     let mut souris_capturee = false;
+    // Emplacement NV12 actuellement à l'écran, libéré après la présentation suivante.
+    let mut slot_affiche: Option<SlotIndex> = None;
+    // Image retirée de la boîte aux lettres mais pas encore présentée (la chaîne d'échange
+    // n'était pas prête) : elle est conservée d'une itération à l'autre.
+    let mut image_a_presenter: Option<DecodedFrame> = None;
+    let mut derniere_mesure = Instant::now();
 
     log::info!(
         "Fenêtre prête. Ctrl+Alt+Shift+Q quitter, Ctrl+Alt+Shift+Z souris, F3 stats, F11 plein écran."
@@ -167,12 +198,23 @@ fn executer() -> Result<()> {
                             );
                             let vue = stats.instantane();
                             log::info!(
-                                "stats : présentées {} ({:.1}/s), reçues {}, décodées {}, jetées {}",
+                                "stats : présentées {} ({:.1}/s), reçues {}, décodées {}, \
+                                 jetées {}, refusées {} | décodage {} | \
+                                 réception -> présentation {}",
                                 vue.images_presentees,
                                 cadence_presentation.valeur(),
                                 vue.unites_recues,
                                 vue.images_decodees,
-                                vue.images_jetees
+                                vue.images_jetees,
+                                vue.unites_refusees,
+                                stats
+                                    .decodage
+                                    .consulter()
+                                    .map_or_else(|| "-".to_owned(), |r| r.en_millisecondes()),
+                                stats
+                                    .reception_presentation
+                                    .consulter()
+                                    .map_or_else(|| "-".to_owned(), |r| r.en_millisecondes())
                             );
                         }
                         Some(Action::BasculerCaptureSouris) => {
@@ -190,21 +232,63 @@ fn executer() -> Result<()> {
             }
         }
 
-        // On n'entame une image que lorsque la chaîne d'échange est prête : c'est ce qui
-        // tient la latence à une image.
+        journaliser_mesures(&stats, &mut derniere_mesure, &cadence_presentation);
+
+        // Dernière image décodée, ou rien si le flux est muet. Règle 3 : la boîte aux
+        // lettres ne rend que la plus récente.
+        if image_a_presenter.is_none() {
+            image_a_presenter = boite.attendre_et_retirer(Duration::from_millis(ATTENTE_IMAGE_MS));
+        }
+
+        // Rien de neuf : on garde ce qui est déjà à l'écran plutôt que de présenter une
+        // image identique, ce qui économise le GPU et ne change rien à l'affichage.
+        let Some(image) = image_a_presenter else {
+            continue;
+        };
+
+        // L'attente de la chaîne d'échange ne vient qu'*après* avoir une image à montrer.
+        // L'objet de latence est à réarmement automatique : l'attendre sans présenter
+        // consomme le signal, et plus rien ne le réarme avant le `Present` suivant. La
+        // boucle resterait alors bloquée tant que le flux est muet.
         if !presenter.attendre_disponibilite(ATTENTE_PRESENTATION_MS) {
+            // On garde l'image pour la prochaine itération : elle n'est pas perdue.
             continue;
         }
 
-        let vue = stats.instantane();
-        let zone: Viewport = letterbox(presenter.taille(), (vue.largeur, vue.hauteur));
+        // La chaîne d'échange était peut-être prête depuis un moment : s'il y a plus récent,
+        // on l'affiche à la place (règle 3) et on recycle l'emplacement abandonné.
+        let image = match boite.retirer() {
+            Some(plus_recente) => {
+                pool.liberer(image.slot);
+                stats.compter_image_jetee();
+                plus_recente
+            }
+            None => image,
+        };
+        image_a_presenter = None;
 
-        presenter.effacer(&gpu, COULEUR_FOND, zone);
-        // Étape 3 : dessin du triangle plein écran NV12 -> RGB dans `zone`.
+        let zone: Viewport = letterbox(presenter.taille(), (image.width, image.height));
 
-        match presenter.presenter() {
+        presenter.effacer(&gpu, COULEUR_FOND);
+        match pool.vues(image.slot) {
+            Some((luma, chroma)) => presenter.dessiner(&gpu, &pipeline, (&luma, &chroma), zone),
+            // L'emplacement a disparu (réallocation pour un changement de résolution) :
+            // on présente le fond, l'image suivante sera correcte.
+            None => log::debug!("Emplacement {} introuvable au moment du rendu.", image.slot),
+        }
+
+        let resultat = presenter.presenter();
+
+        // L'emplacement de l'image *précédente* n'est rendu qu'ici : la présentation qu'on
+        // vient d'attendre garantit que le GPU a fini de la lire. Sans ce décalage d'une
+        // image, le décodeur pourrait réécrire une texture encore en cours de lecture.
+        if let Some(precedente) = slot_affiche.replace(image.slot) {
+            pool.liberer(precedente);
+        }
+
+        match resultat {
             Ok(()) => {
-                stats.compter_image_presentee(std::time::Duration::ZERO);
+                stats.compter_image_presentee(image.duree_jusqu_a(Instant::now()));
                 cadence_presentation.echantillonner(stats.instantane().images_presentees);
             }
             Err(RenderError::Api { operation, source }) => {
@@ -219,16 +303,52 @@ fn executer() -> Result<()> {
     }
 
     log::info!("Fenêtre fermée par l'utilisateur, arrêt.");
-    // Avant de rendre la main : on coupe la réception et on attend le thread, pour que son
-    // résumé final soit journalisé et que l'entrée soit refermée proprement.
+    // Avant de rendre la main : on coupe la réception, ce qui réveille le thread vidéo
+    // bloqué sur le réseau, et on attend sa fin pour refermer l'entrée proprement.
+    // La boîte aux lettres est arrêtée pour qu'aucune publication ne reste en attente.
+    boite.arreter();
     thread_video.arreter();
     Ok(())
+}
+
+/// Journalise une fois par seconde les mesures qui serviront à comparer avec mpv.
+///
+/// `Agregat::vider` remet les compteurs à zéro : la moyenne et le maximum portent donc bien
+/// sur la seconde écoulée, et non depuis le démarrage.
+fn journaliser_mesures(stats: &Stats, derniere: &mut Instant, cadence: &Cadence) {
+    if derniere.elapsed() < PERIODE_MESURES {
+        return;
+    }
+    *derniere = Instant::now();
+
+    let decodage = stats.decodage.vider();
+    let bout_en_bout = stats.reception_presentation.vider();
+    if decodage.is_none() && bout_en_bout.is_none() {
+        return;
+    }
+
+    let vue = stats.instantane();
+    log::info!(
+        "image : {:.1} présentées/s, {}x{} | décodage {} | réception -> présentation {} | décodées {}, jetées {}, refusées {}",
+        cadence.valeur(),
+        vue.largeur,
+        vue.hauteur,
+        decodage.map_or_else(|| "-".to_owned(), |r| r.en_millisecondes()),
+        bout_en_bout.map_or_else(|| "-".to_owned(), |r| r.en_millisecondes()),
+        vue.images_decodees,
+        vue.images_jetees,
+        vue.unites_refusees
+    );
 }
 
 /// Passe la console en UTF-8, sinon les accents des journaux sont illisibles : Rust écrit
 /// de l'UTF-8 alors que la console Windows utilise par défaut une page de code héritée.
 ///
 /// Un échec (sortie redirigée vers un fichier, pas de console attachée) est sans gravité.
+///
+/// **Seule exception à la règle 5** (`unsafe` confiné à `render/` et aux deux modules
+/// FFmpeg) : un appel système sans pointeur ni allocation, qui ne peut pas corrompre la
+/// mémoire. Le déplacer dans `render/` serait moins clair que de l'assumer ici.
 fn regler_console_en_utf8() {
     use windows::Win32::System::Console::SetConsoleOutputCP;
 
@@ -287,29 +407,6 @@ fn action_clavier(
         Some(Scancode::F11) => Some(Action::BasculerPleinEcran),
         _ => None,
     }
-}
-
-/// Récupère le `HWND` Win32 de la fenêtre SDL3, via ses propriétés.
-///
-/// SDL3 expose le handle natif par la propriété `SDL_PROP_WINDOW_WIN32_HWND_POINTER`, ce qui
-/// évite de dépendre de l'API `raw-window-handle`, encore mouvante.
-fn hwnd_de(fenetre: &sdl3::video::Window) -> Result<HWND, RenderError> {
-    use sdl3::sys::properties::SDL_GetPointerProperty;
-    use sdl3::sys::video::{SDL_GetWindowProperties, SDL_PROP_WINDOW_WIN32_HWND_POINTER};
-
-    // SAFETY: `fenetre.raw()` est un `SDL_Window*` valide tant que `fenetre` vit ;
-    // SDL_GetWindowProperties renvoie un identifiant détenu par SDL (rien à libérer), et
-    // SDL_GetPointerProperty se contente de lire une valeur, en renvoyant le défaut fourni
-    // (ici null) si la propriété est absente.
-    let pointeur = unsafe {
-        let proprietes = SDL_GetWindowProperties(fenetre.raw());
-        SDL_GetPointerProperty(proprietes, SDL_PROP_WINDOW_WIN32_HWND_POINTER, std::ptr::null_mut())
-    };
-
-    if pointeur.is_null() {
-        return Err(RenderError::FenetreSansHwnd);
-    }
-    Ok(HWND(pointeur))
 }
 
 impl Config {

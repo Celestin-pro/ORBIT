@@ -53,7 +53,7 @@ impl VerrouD3d11 {
     /// Prend le verrou et le rend à la fin de la portée.
     pub fn prendre(&self) -> GardeVerrou<'_> {
         // SAFETY: `section` a été initialisée par `nouveau` et n'est détruite que dans
-        // `Drop`, après que toutes les gardes ont disparu (elles emprunntent `self`).
+        // `Drop`, après que toutes les gardes ont disparu (elles empruntent `self`).
         unsafe { EnterCriticalSection(self.section.get()) };
         GardeVerrou { verrou: self }
     }

@@ -42,11 +42,14 @@ version = "0.62"
 features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D_Fxc",
     "Win32_Graphics_Direct3D10",
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_System_Console",
+    # CRITICAL_SECTION et ses fonctions sont derrière cette fonctionnalité.
+    "Win32_System_Kernel",
     "Win32_System_Threading",
 ]
 

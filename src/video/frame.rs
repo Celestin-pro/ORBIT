@@ -28,14 +28,16 @@ pub struct DecodedFrame {
     pub pts_us: Option<i64>,
     /// Instant de réception de l'unité d'accès correspondante.
     pub t_received: Instant,
+    /// Instant où l'unité d'accès a été remise au décodeur.
+    pub t_submitted: Instant,
     /// Instant où le décodage s'est terminé.
     pub t_decoded: Instant,
 }
 
 impl DecodedFrame {
-    /// Durée écoulée entre la réception réseau et la fin du décodage.
+    /// Temps de décodage : de la remise au décodeur à la fin du décodage.
     pub fn duree_decodage(&self) -> Duration {
-        self.t_decoded.saturating_duration_since(self.t_received)
+        self.t_decoded.saturating_duration_since(self.t_submitted)
     }
 
     /// Durée écoulée entre la réception réseau et l'instant donné (la présentation).
@@ -140,11 +142,6 @@ impl Mailbox {
         self.reveil.notify_all();
     }
 
-    /// Vrai si l'arrêt a été demandé.
-    pub fn est_arretee(&self) -> bool {
-        self.verrou().arret
-    }
-
     /// Prise du verrou tolérante à l'empoisonnement (règle 6 : pas de `panic!` ici).
     fn verrou(&self) -> std::sync::MutexGuard<'_, EtatBoite> {
         match self.place.lock() {
@@ -168,6 +165,7 @@ mod tests {
             height: 1080,
             pts_us: Some(slot as i64),
             t_received: maintenant,
+            t_submitted: maintenant,
             t_decoded: maintenant,
         }
     }
@@ -240,8 +238,9 @@ mod tests {
         });
 
         assert!(boite.attendre_et_retirer(Duration::from_secs(2)).is_none());
-        assert!(boite.est_arretee());
+        // Après l'arrêt, tout dépôt est refusé : l'appelant doit recycler l'emplacement.
         assert_eq!(boite.publier(image(0)), Depot::Arret);
+        assert!(boite.retirer().is_none());
         fil.join().expect("le fil stoppeur doit se terminer");
     }
 
@@ -249,9 +248,14 @@ mod tests {
     fn les_durees_ne_debordent_jamais() {
         let plus_tard = Instant::now();
         let mut img = image(0);
-        img.t_received = plus_tard;
-        // t_decoded antérieur à t_received (horloge non monotone entre threads) : 0, pas de panique.
+        img.t_submitted = plus_tard;
+        // t_decoded antérieur à t_submitted : on renvoie 0, pas de panique par débordement.
         img.t_decoded = plus_tard - Duration::from_millis(5);
         assert_eq!(img.duree_decodage(), Duration::ZERO);
+
+        // Et la mesure réception -> présentation se mesure bien depuis t_received.
+        let mut img = image(0);
+        img.t_received = plus_tard - Duration::from_millis(10);
+        assert!(img.duree_jusqu_a(plus_tard) >= Duration::from_millis(10));
     }
 }

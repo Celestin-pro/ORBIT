@@ -49,6 +49,8 @@ pub struct LavfSource {
     /// Base de temps de ce flux, pour convertir les PTS en microsecondes.
     base_temps: ff::AVRational,
     info: Option<StreamInfo>,
+    /// Jeux de paramètres annoncés par l'entrée (`codecpar->extradata`), en Annex B.
+    jeux_de_parametres: Vec<u8>,
     url: String,
     /// Drapeau lu par le rappel d'interruption de FFmpeg. Il doit rester à une adresse
     /// stable aussi longtemps que le contexte vit, d'où l'`Arc`.
@@ -76,14 +78,17 @@ impl LavfSource {
             }
         });
 
-        // FFmpeg écrit ses propres diagnostics sur stderr ; on en garde les avertissements,
-        // qui sont utiles quand un flux est mal formé, sans le bavardage de niveau info.
+        // FFmpeg écrit ses propres diagnostics directement sur stderr, sans passer par notre
+        // journal. Tant qu'une image clé n'est pas arrivée, le décodeur en émet une paire par
+        // image (« non-existing PPS », « Error constructing the frame RPS ») : c'est normal
+        // quand on rejoint un flux en cours, et notre compteur d'unités refusées le rapporte
+        // déjà. On ne garde donc que le fatal, sauf en mode debug.
         // SAFETY: simple réglage d'un entier global, sans précondition.
         unsafe {
             ff::av_log_set_level(if log::log_enabled!(log::Level::Debug) {
                 ff::AV_LOG_VERBOSE
             } else {
-                ff::AV_LOG_WARNING
+                ff::AV_LOG_FATAL
             });
         }
 
@@ -100,6 +105,7 @@ impl LavfSource {
             index_video: -1,
             base_temps: ff::AVRational { num: 1, den: 90_000 },
             info: None,
+            jeux_de_parametres: Vec::new(),
             url: url.to_owned(),
             arret,
         };
@@ -209,11 +215,26 @@ impl LavfSource {
 
         // SAFETY: `index` est un indice de flux validé par av_find_best_stream ; les
         // pointeurs `streams` et `codecpar` sont garantis non nuls par libavformat pour un
-        // contexte ouvert.
-        let (id_codec, largeur, hauteur, base_temps) = unsafe {
+        // contexte ouvert. `extradata` peut être nul (taille nulle), cas traité.
+        let (id_codec, largeur, hauteur, base_temps, jeux) = unsafe {
             let flux = *(*self.contexte).streams.add(index as usize);
             let parametres = (*flux).codecpar;
-            ((*parametres).codec_id, (*parametres).width, (*parametres).height, (*flux).time_base)
+
+            let extradata = (*parametres).extradata;
+            let taille = usize::try_from((*parametres).extradata_size).unwrap_or(0);
+            let jeux = if extradata.is_null() || taille == 0 {
+                Vec::new()
+            } else {
+                std::slice::from_raw_parts(extradata, taille).to_vec()
+            };
+
+            (
+                (*parametres).codec_id,
+                (*parametres).width,
+                (*parametres).height,
+                (*flux).time_base,
+                jeux,
+            )
         };
 
         let codec = match id_codec {
@@ -224,8 +245,18 @@ impl LavfSource {
             }
         };
 
+        if jeux.is_empty() {
+            log::warn!(
+                "L'entrée n'annonce aucun jeu de paramètres : le décodage ne démarrera qu'à \
+                 la première unité SPS/PPS reçue dans le flux."
+            );
+        } else {
+            log::debug!("Jeux de paramètres annoncés : {} octets.", jeux.len());
+        }
+
         self.index_video = index;
         self.base_temps = base_temps;
+        self.jeux_de_parametres = jeux;
         self.info =
             Some(StreamInfo { codec, width: largeur.max(0) as u32, height: hauteur.max(0) as u32 });
         Ok(())
@@ -244,6 +275,7 @@ impl LavfSource {
         self.contexte = ptr::null_mut();
         self.index_video = -1;
         self.info = None;
+        self.jeux_de_parametres.clear();
     }
 
     /// Vrai si l'arrêt a été demandé par l'appelant.
@@ -266,6 +298,10 @@ impl LavfSource {
 impl VideoSource for LavfSource {
     fn stream_info(&self) -> Option<StreamInfo> {
         self.info
+    }
+
+    fn parameter_sets(&self) -> &[u8] {
+        &self.jeux_de_parametres
     }
 
     fn next_access_unit(&mut self, unite: &mut AccessUnit) -> Result<(), SourceError> {

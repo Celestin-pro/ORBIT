@@ -1,12 +1,87 @@
 //! Compteurs du chemin vidéo, partagés entre les threads.
 //!
-//! L'overlay F3 (étape 4) ne fait que lire ces valeurs. Tout est en atomiques : aucun verrou
-//! sur le chemin temps réel, et aucun `panic!` possible (règle 6).
+//! L'overlay F3 (étape 4) et le résumé périodique du journal ne font que lire ces valeurs.
+//! Tout est en atomiques : aucun verrou sur le chemin temps réel, et aucun `panic!`
+//! possible (règle 6).
+//!
+//! Deux mesures servent à comparer avec mpv :
+//! - le **temps de décodage** : de la remise de l'unité d'accès au décodeur à la fin du
+//!   décodage de l'image ;
+//! - le **temps réception -> présentation** : de l'arrivée des octets sur le socket à
+//!   l'appel `Present`. C'est la latence imputable au player.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-/// Compteurs cumulés et dernières mesures du chemin vidéo.
+/// Accumulateur d'une mesure : nombre, somme et maximum, pour une moyenne et un pire cas.
+///
+/// `vider` remet les trois à zéro et renvoie le résumé : la fenêtre d'observation est donc
+/// décidée par l'appelant (une seconde dans le journal).
+#[derive(Debug, Default)]
+pub struct Agregat {
+    nombre: AtomicU64,
+    somme_us: AtomicU64,
+    max_us: AtomicU64,
+}
+
+impl Agregat {
+    pub fn ajouter(&self, duree: Duration) {
+        let microsecondes = u64::try_from(duree.as_micros()).unwrap_or(u64::MAX);
+        self.nombre.fetch_add(1, Ordering::Relaxed);
+        self.somme_us.fetch_add(microsecondes, Ordering::Relaxed);
+        self.max_us.fetch_max(microsecondes, Ordering::Relaxed);
+    }
+
+    /// Résumé de la fenêtre, puis remise à zéro. `None` si rien n'a été mesuré.
+    pub fn vider(&self) -> Option<ResumeAgregat> {
+        let nombre = self.nombre.swap(0, Ordering::Relaxed);
+        let somme_us = self.somme_us.swap(0, Ordering::Relaxed);
+        let max_us = self.max_us.swap(0, Ordering::Relaxed);
+
+        if nombre == 0 {
+            return None;
+        }
+        Some(ResumeAgregat {
+            nombre,
+            moyenne: Duration::from_micros(somme_us / nombre),
+            maximum: Duration::from_micros(max_us),
+        })
+    }
+
+    /// Lecture sans remise à zéro, pour l'overlay.
+    pub fn consulter(&self) -> Option<ResumeAgregat> {
+        let nombre = self.nombre.load(Ordering::Relaxed);
+        if nombre == 0 {
+            return None;
+        }
+        Some(ResumeAgregat {
+            nombre,
+            moyenne: Duration::from_micros(self.somme_us.load(Ordering::Relaxed) / nombre),
+            maximum: Duration::from_micros(self.max_us.load(Ordering::Relaxed)),
+        })
+    }
+}
+
+/// Moyenne et maximum sur une fenêtre d'observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResumeAgregat {
+    pub nombre: u64,
+    pub moyenne: Duration,
+    pub maximum: Duration,
+}
+
+impl ResumeAgregat {
+    /// Format compact en millisecondes, pour le journal et l'overlay.
+    pub fn en_millisecondes(&self) -> String {
+        format!(
+            "moy {:.2} ms / max {:.2} ms",
+            self.moyenne.as_secs_f64() * 1_000.0,
+            self.maximum.as_secs_f64() * 1_000.0
+        )
+    }
+}
+
+/// Compteurs cumulés et mesures du chemin vidéo.
 #[derive(Debug, Default)]
 pub struct Stats {
     /// Unités d'accès reçues du réseau.
@@ -17,10 +92,14 @@ pub struct Stats {
     pub images_presentees: AtomicU64,
     /// Images jetées parce qu'une plus récente les a remplacées dans la boîte aux lettres.
     pub images_jetees: AtomicU64,
-    /// Dernière durée de décodage, en microsecondes.
-    pub decodage_us: AtomicU64,
-    /// Dernière durée « réception -> présentation », en microsecondes.
-    pub reception_presentation_us: AtomicU64,
+    /// Unités d'accès refusées par le décodeur (avant la première image clé, après une perte).
+    pub unites_refusees: AtomicU64,
+
+    /// Temps de décodage sur la fenêtre courante.
+    pub decodage: Agregat,
+    /// Temps réception -> présentation sur la fenêtre courante.
+    pub reception_presentation: Agregat,
+
     /// Résolution courante du flux.
     pub largeur: AtomicU32,
     pub hauteur: AtomicU32,
@@ -31,25 +110,24 @@ impl Stats {
         Self::default()
     }
 
-    // Alimentés par les threads de réception et de décodage (étapes 2 et 3) ; déjà testés.
-    #[allow(dead_code)]
     pub fn compter_unite_recue(&self) {
         self.unites_recues.fetch_add(1, Ordering::Relaxed);
     }
 
-    #[allow(dead_code)]
+    pub fn compter_unite_refusee(&self) {
+        self.unites_refusees.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn compter_image_decodee(&self, duree: Duration) {
         self.images_decodees.fetch_add(1, Ordering::Relaxed);
-        self.decodage_us.store(duree.as_micros().min(u64::MAX as u128) as u64, Ordering::Relaxed);
+        self.decodage.ajouter(duree);
     }
 
     pub fn compter_image_presentee(&self, latence: Duration) {
         self.images_presentees.fetch_add(1, Ordering::Relaxed);
-        self.reception_presentation_us
-            .store(latence.as_micros().min(u64::MAX as u128) as u64, Ordering::Relaxed);
+        self.reception_presentation.ajouter(latence);
     }
 
-    #[allow(dead_code)]
     pub fn compter_image_jetee(&self) {
         self.images_jetees.fetch_add(1, Ordering::Relaxed);
     }
@@ -59,33 +137,29 @@ impl Stats {
         self.hauteur.store(hauteur, Ordering::Relaxed);
     }
 
-    /// Instantané cohérent « à peu près » : les compteurs sont lus un à un, ce qui suffit
-    /// à un affichage.
+    /// Instantané des compteurs cumulés. Les compteurs sont lus un à un, ce qui suffit à un
+    /// affichage.
     pub fn instantane(&self) -> Instantane {
         Instantane {
             unites_recues: self.unites_recues.load(Ordering::Relaxed),
             images_decodees: self.images_decodees.load(Ordering::Relaxed),
             images_presentees: self.images_presentees.load(Ordering::Relaxed),
             images_jetees: self.images_jetees.load(Ordering::Relaxed),
-            decodage: Duration::from_micros(self.decodage_us.load(Ordering::Relaxed)),
-            reception_presentation: Duration::from_micros(
-                self.reception_presentation_us.load(Ordering::Relaxed),
-            ),
+            unites_refusees: self.unites_refusees.load(Ordering::Relaxed),
             largeur: self.largeur.load(Ordering::Relaxed),
             hauteur: self.hauteur.load(Ordering::Relaxed),
         }
     }
 }
 
-/// Copie des compteurs à un instant donné.
+/// Copie des compteurs cumulés à un instant donné.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Instantane {
     pub unites_recues: u64,
     pub images_decodees: u64,
     pub images_presentees: u64,
     pub images_jetees: u64,
-    pub decodage: Duration,
-    pub reception_presentation: Duration,
+    pub unites_refusees: u64,
     pub largeur: u32,
     pub hauteur: u32,
 }
@@ -138,6 +212,7 @@ mod tests {
         stats.compter_image_decodee(Duration::from_micros(2_500));
         stats.compter_image_presentee(Duration::from_micros(8_000));
         stats.compter_image_jetee();
+        stats.compter_unite_refusee();
         stats.enregistrer_resolution(1920, 1080);
 
         let vue = stats.instantane();
@@ -145,9 +220,47 @@ mod tests {
         assert_eq!(vue.images_decodees, 1);
         assert_eq!(vue.images_presentees, 1);
         assert_eq!(vue.images_jetees, 1);
-        assert_eq!(vue.decodage, Duration::from_micros(2_500));
-        assert_eq!(vue.reception_presentation, Duration::from_micros(8_000));
+        assert_eq!(vue.unites_refusees, 1);
         assert_eq!((vue.largeur, vue.hauteur), (1920, 1080));
+    }
+
+    #[test]
+    fn l_agregat_calcule_moyenne_et_maximum() {
+        let agregat = Agregat::default();
+        assert!(agregat.vider().is_none(), "un agrégat vide ne renvoie rien");
+
+        agregat.ajouter(Duration::from_micros(1_000));
+        agregat.ajouter(Duration::from_micros(3_000));
+        agregat.ajouter(Duration::from_micros(2_000));
+
+        let consulte = agregat.consulter().expect("trois mesures");
+        assert_eq!(consulte.nombre, 3);
+        assert_eq!(consulte.moyenne, Duration::from_micros(2_000));
+        assert_eq!(consulte.maximum, Duration::from_micros(3_000));
+
+        // `consulter` ne vide pas.
+        let resume = agregat.vider().expect("toujours trois mesures");
+        assert_eq!(resume, consulte);
+
+        // ... mais `vider` remet à zéro.
+        assert!(agregat.vider().is_none());
+    }
+
+    #[test]
+    fn le_resume_s_affiche_en_millisecondes() {
+        let agregat = Agregat::default();
+        agregat.ajouter(Duration::from_micros(1_500));
+        agregat.ajouter(Duration::from_micros(4_500));
+        let texte = agregat.consulter().expect("deux mesures").en_millisecondes();
+        assert_eq!(texte, "moy 3.00 ms / max 4.50 ms");
+    }
+
+    #[test]
+    fn une_duree_extreme_ne_deborde_pas() {
+        let agregat = Agregat::default();
+        agregat.ajouter(Duration::MAX);
+        let resume = agregat.consulter().expect("une mesure");
+        assert_eq!(resume.maximum, Duration::from_micros(u64::MAX));
     }
 
     #[test]
