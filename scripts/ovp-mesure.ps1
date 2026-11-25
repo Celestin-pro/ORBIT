@@ -19,14 +19,19 @@
 #>
 param(
     [Parameter(Mandatory = $true)] [string]$Client,
-    [string]$Exe = (Join-Path $PSScriptRoot 'orbit-sender.exe'),
+    [string]$Exe,
     [string]$Ffmpeg = 'ffmpeg',
     [int]$Duree = 60,
     [int]$DebitMbps = 20,
-    [string]$Dossier = (Join-Path $PSScriptRoot ("mesures-" + (Get-Date -Format 'yyyyMMdd-HHmm')))
+    [string]$Dossier
 )
 
 $ErrorActionPreference = 'Stop'
+# Sous PowerShell 5.1, $PSScriptRoot est vide dans les valeurs par défaut de param() :
+# les chemins par défaut sont donc calculés ici.
+$ici = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+if (-not $Exe) { $Exe = Join-Path $ici 'orbit-sender.exe' }
+if (-not $Dossier) { $Dossier = Join-Path $ici ("mesures-" + (Get-Date -Format 'yyyyMMdd-HHmm')) }
 if (-not (Test-Path $Exe)) { throw "orbit-sender introuvable : $Exe (option -Exe)" }
 New-Item -ItemType Directory -Force $Dossier | Out-Null
 
