@@ -48,6 +48,18 @@ réellement (probablement pour le son).
 | ↳ `instant` | 0.1 | BSD-3-Clause | idem (permissive) |
 | `thiserror` | 2.0 | MIT OR Apache-2.0 | |
 | `proptest` | 1.x | MIT OR Apache-2.0 | tests uniquement (`dev-dependencies`) |
+| `socket2` | 0.6 | MIT OR Apache-2.0 | exemple `recv_stats` uniquement (`dev-dependencies`) |
+
+`orbit-sender` (émetteur, PC fixe) : `orbit-protocol`, `anyhow`, `clap`, `env_logger`, `log`,
+`windows` (mêmes versions et licences que le player), plus :
+
+| Crate | Version | Licence | Remarques |
+|---|---|---|---|
+| `crossbeam-channel` | 0.5 | MIT OR Apache-2.0 | canaux entre threads (`recv_timeout`, `is_empty`) |
+| `ctrlc` | 3.4 | MIT OR Apache-2.0 | arrêt propre sur Ctrl+C (tue ffmpeg) |
+
+ffmpeg n'est **pas** lié à `orbit-sender` : c'est un programme externe lancé en sous-processus
+(`--ffmpeg`), quel que soit son build.
 
 ## Vérification
 

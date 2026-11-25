@@ -173,6 +173,11 @@ la demande forcera une image clé immédiate.
   - `show` : continuer à livrer (artefacts possibles jusqu'à la prochaine image clé).
 - Jeux de paramètres (SPS/PPS/VPS) : extraits de la première image clé (Annex B) et passés au
   décodeur via `VideoSource::configure`, comme le fait déjà `LavfSource`.
+- **Réception sous Windows** : lire le socket dans un thread dédié, en `recv_from` **bloquant
+  sans délai** (pas de `SO_RCVTIMEO`) et avec un tampon de réception de 8 Mo. Un `recv_from` qui
+  expire peut perdre le datagramme qui arrive au même instant (Winsock : « socket in an
+  indeterminate state ») : mesuré en boucle locale, ~1 fragment perdu par seconde, souvent le
+  premier d'une image ; zéro perte après correction.
 - Statistiques exposées à l'overlay F3 : images ok / récupérées par FEC / perdues / en retard,
   fragments perdus, gigue, débit, demandes d'image clé envoyées.
 
@@ -190,9 +195,15 @@ orbit-sender --client <IP portable>
              [--split silence|aud] [--split-silence-us 1000]
              [--pacing-factor 1.5] [--burst 4] [--no-pacing]
              [--source desktop|test]        test = mire testsrc2, pour développer sans capture
+             [--encoder nvenc|qsv|mf|openh264]   qsv/mf/openh264 : développement sans NVIDIA
              [--ffmpeg <chemin>]
-             [--simulate-loss <pct>]        jette volontairement des paquets à l'envoi (tests FEC)
+             [--simulate-loss <pct>] [--seed 1]  jette volontairement des paquets à l'envoi (tests FEC)
+             [--no-feedback-wait]           envoyer sans attendre de HELLO (tests sans retour)
+             [--duration-s <s>]             arrêt automatique (mesures comparatives)
 ```
+Résumé dans le journal chaque seconde : images envoyées, débit sur le fil, paquets de parité,
+étalement réel de chaque image (premier → dernier `send_to`) comparé à la cible, retard de réveil
+du timer, débordements (image terminée sans pacing), et les STATS reçues du portable.
 Commande ffmpeg lancée (source desktop, H.264) :
 `ffmpeg -hide_banner -loglevel warning -f lavfi -i ddagrab=framerate=<fps> [-vf hwdownload,format=bgra,scale=W:H,format=nv12]
  -c:v h264_nvenc -preset p1 -tune ull -zerolatency 1 -delay 0 -bf 0 -rc cbr -b:v <B>M -maxrate <B>M
@@ -207,6 +218,20 @@ suivant, soit une image de retard. Par défaut (`--split silence`), le sender é
 ffmpeg n'a rien écrit depuis `--split-silence-us` (1 ms) si elle contient déjà une tranche ; l'AUD
 suivant confirme la coupure (sinon l'erreur est comptée et journalisée). `--split aud` attend
 l'AUD suivant (mode sûr, une image de latence en plus).
+
+### recv_stats (PC portable, exemple de `orbit-protocol`)
+Récepteur de mesure, sans décodage :
+```
+cargo run -p orbit-protocol --example recv_stats --release -- --host <IP fixe>
+    [--port 5000] [--feedback-port 5003] [--on-loss freeze|show] [--frame-lost-timeout-ms 20]
+    [--simulate-loss <pct>] [--seed 1] [--dump <fichier.h264>] [--trace-losses] [--duration-s <s>]
+```
+Il envoie HELLO / STATS / KEYFRAME_REQUEST comme le fera le player, et écrit chaque seconde les
+images ok / récupérées / perdues, le taux de fragments perdus, l'**étalement à l'arrivée**
+(premier fragment → image complète : quelques centaines de µs en rafale, proche de la cible avec
+pacing) et la gigue. `--trace-losses` liste les fragments manquants de chaque image récupérée ou
+perdue (des indices consécutifs = pertes en rafale). `--dump` écrit les images livrées (Annex B),
+lisibles par `ffplay`.
 
 ### orbit-player (PC portable) – ajouts
 ```

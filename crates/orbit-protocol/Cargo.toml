@@ -15,3 +15,5 @@ thiserror = "2.0"
 
 [dev-dependencies]
 proptest = "1.5"
+# Exemple recv_stats : tampon de réception de 8 Mo (celui de Windows, 64 Ko, déborde).
+socket2 = "0.6"

@@ -70,6 +70,11 @@ impl AnnexBSplitter {
         self.stats
     }
 
+    /// Vrai si l'image en cours contient déjà une tranche (elle peut être coupée sur silence).
+    pub fn has_pending_slice(&self) -> bool {
+        self.has_vcl
+    }
+
     /// Ajoute des octets lus ; les images terminées (par un AUD) sont ajoutées à `out`.
     pub fn push(&mut self, bytes: &[u8], out: &mut Vec<AccessUnit>) {
         self.buf.extend_from_slice(bytes);
