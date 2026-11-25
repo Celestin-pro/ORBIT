@@ -107,6 +107,32 @@ impl SourceError {
     }
 }
 
+/// Mesures propres à une source, affichées telles quelles dans l'overlay F3 et le journal.
+///
+/// Une simple liste de paires (libellé, valeur) : chaque implémentation y met ce qui a du
+/// sens pour elle (pertes de fragments, corrections FEC, gigue pour le protocole maison),
+/// sans que le reste du programme ait à connaître ces notions. Aucun type FFmpeg.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SourceStats {
+    pub lignes: Vec<(String, String)>,
+}
+
+impl SourceStats {
+    /// Ajoute une ligne « libellé : valeur ».
+    ///
+    /// `LavfSource` n'a rien à ajouter : seule une future source (protocole maison) s'en
+    /// servira, d'où l'exception au contrôle du code mort hors tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn ajouter(&mut self, libelle: impl Into<String>, valeur: impl Into<String>) {
+        self.lignes.push((libelle.into(), valeur.into()));
+    }
+
+    /// Vide la liste en gardant sa capacité (elle est remplie une fois par seconde).
+    pub fn vider(&mut self) {
+        self.lignes.clear();
+    }
+}
+
 /// Fournisseur d'unités d'accès H.264/HEVC.
 ///
 /// Implémentations : `LavfSource` (v0.1, libavformat + MPEG-TS sur UDP/SRT), puis
@@ -136,6 +162,12 @@ pub trait VideoSource: Send {
 
     /// Description courte pour l'overlay de stats (« udp://0.0.0.0:5000 »).
     fn description(&self) -> String;
+
+    /// Ajoute à `sortie` les mesures propres à cette source. Appelé une fois par seconde par
+    /// le thread vidéo, hors du chemin critique ; `sortie` arrive vide.
+    ///
+    /// Par défaut, rien : `LavfSource` n'a pas de mesure à ajouter à celles du thread vidéo.
+    fn source_stats(&self, _sortie: &mut SourceStats) {}
 }
 
 #[cfg(test)]
@@ -170,6 +202,22 @@ mod tests {
             !SourceError::Ouverture { url: "udp://x".into(), cause: "refus".into() }
                 .est_recuperable()
         );
+    }
+
+    #[test]
+    fn les_source_stats_se_remplissent_et_se_vident() {
+        let mut stats = SourceStats::default();
+        stats.ajouter("Fragments perdus", "3");
+        stats.ajouter(String::from("FEC"), format!("{} corrigés", 2));
+        assert_eq!(
+            stats.lignes,
+            vec![
+                ("Fragments perdus".to_owned(), "3".to_owned()),
+                ("FEC".to_owned(), "2 corrigés".to_owned())
+            ]
+        );
+        stats.vider();
+        assert!(stats.lignes.is_empty());
     }
 
     #[test]

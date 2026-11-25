@@ -284,7 +284,7 @@ impl Pipeline {
 }
 
 /// Compile un étage de shader depuis la source HLSL embarquée.
-fn compiler_shader(
+pub(crate) fn compiler_shader(
     source: &str,
     point_entree: windows::core::PCSTR,
     cible: windows::core::PCSTR,
@@ -329,7 +329,7 @@ fn compiler_shader(
 }
 
 /// Vue sur les octets d'un blob Direct3D.
-fn octets_blob(blob: &ID3DBlob) -> &[u8] {
+pub(crate) fn octets_blob(blob: &ID3DBlob) -> &[u8] {
     // SAFETY: un blob valide expose un tampon de `GetBufferSize` octets à l'adresse
     // `GetBufferPointer` ; la tranche ne vit pas plus longtemps que l'emprunt du blob.
     unsafe {
@@ -650,6 +650,11 @@ impl Presenter {
     /// Taille courante des tampons.
     pub fn taille(&self) -> (u32, u32) {
         self.taille
+    }
+
+    /// Vue de rendu du tampon courant, pour les calques de texte (`render::overlay`).
+    pub fn cible(&self) -> Option<&ID3D11RenderTargetView> {
+        self.cible.as_ref()
     }
 }
 

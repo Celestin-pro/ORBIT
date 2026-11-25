@@ -17,6 +17,12 @@ Le lien dynamique vers FFmpeg LGPL est ce qui autorise une licence permissive c�
 `orbit-player` : les DLL sont distribuées telles quelles, remplaçables par l'utilisateur, et
 aucun code FFmpeg n'est incorporé dans l'exécutable.
 
+## Données intégrées au code
+
+| Élément | Licence | Où | Remarques |
+|---|---|---|---|
+| Police bitmap `font8x8` (Daniel Hepper, d'après Marcel Sondaar et les polices VGA d'IBM) | domaine public | `src/render/police.rs` | glyphes ASCII + Latin-1 recopiés de [dhepper/font8x8](https://github.com/dhepper/font8x8) |
+
 ## Crates Rust (dépendances directes)
 
 | Crate | Version | Licence |

@@ -14,8 +14,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::stats::Stats;
-use crate::video::decoder::{FrameSink, HwDecoder};
-use crate::video::source::{AccessUnit, SourceError, StreamInfo, VideoSource};
+use crate::video::decoder::{DecodeError, FrameSink, HwDecoder};
+use crate::video::source::{AccessUnit, SourceError, SourceStats, StreamInfo, VideoSource};
 
 /// Délai d'attente avant une nouvelle tentative d'ouverture après un échec.
 const DELAI_RECONNEXION: Duration = Duration::from_millis(500);
@@ -115,11 +115,22 @@ fn boucle<F, S>(
         }
         log::info!("Décodeur : {}", decodeur.description());
     }
+    stats.publier_description(decodeur.description(), source.description());
 
     let mut unite = AccessUnit::vide();
     let mut journal = Journal::nouveau(info_courante);
+    let mut mesures_source = SourceStats::default();
+    let mut derniere_publication = Instant::now();
 
     while !arret.load(Ordering::Relaxed) {
+        // Une fois par seconde, hors du chemin critique : mesures propres à la source.
+        if derniere_publication.elapsed() >= PERIODE_RESUME {
+            derniere_publication = Instant::now();
+            mesures_source.vider();
+            source.source_stats(&mut mesures_source);
+            stats.publier_source_stats(&mesures_source);
+        }
+
         match source.next_access_unit(&mut unite) {
             Ok(()) if unite.est_vide() => {
                 // Le contrat de `VideoSource` autorise une unité vide ; elle n'apprend rien
@@ -127,7 +138,7 @@ fn boucle<F, S>(
                 log::debug!("Unité d'accès vide ignorée.");
             }
             Ok(()) => {
-                stats.compter_unite_recue();
+                stats.compter_unite_recue(unite.data.len());
                 journal.enregistrer(&unite);
 
                 // La source peut découvrir le flux après coup (premiers paquets avant la
@@ -143,11 +154,17 @@ fn boucle<F, S>(
                             log::error!("Reconfiguration du décodeur impossible : {erreur}");
                             return;
                         }
+                        stats.publier_description(decodeur.description(), source.description());
                     }
                 }
 
                 match decodeur.decode(&unite, sortie) {
                     Ok(()) => {}
+                    Err(erreur @ DecodeError::ImageDefectueuse(_)) => {
+                        // Flux abîmé (pertes réseau) : compté à part des unités refusées.
+                        stats.compter_erreur_decodage();
+                        log::debug!("Erreur de décodage : {erreur}");
+                    }
                     Err(erreur) if erreur.est_recuperable() => {
                         // Normal avant la première image clé, et après une perte de paquets.
                         stats.compter_unite_refusee();
@@ -179,6 +196,7 @@ fn boucle<F, S>(
                         log::error!("Reconfiguration du décodeur impossible : {erreur}");
                         return;
                     }
+                    stats.publier_description(decodeur.description(), source.description());
                 }
             }
             Err(erreur) => {
@@ -593,6 +611,34 @@ mod tests {
         assert_eq!(vue.unites_refusees, 1);
         // La deuxieme a ete decodee : une unite refusee n'interrompt pas le flux.
         assert_eq!(*decodeur.decodes.lock().expect("verrou"), 1);
+    }
+
+    #[test]
+    fn une_image_defectueuse_est_comptee_a_part_des_unites_refusees() {
+        let arret = Arc::new(AtomicBool::new(false));
+        let stats = Arc::new(Stats::new());
+        let mut decodeur = DecodeurFactice::default();
+        *decodeur.prochaine_erreur.lock().expect("verrou") =
+            Some(DecodeError::ImageDefectueuse("macroblocs manquants".into()));
+        let sortie = SortieFactice::default();
+
+        let source = SourceFactice::nouvelle(vec![
+            Ok(vec![0_u8; 64]),
+            Ok(vec![0_u8; 64]),
+            Err(SourceError::CodecNonSupporte("fin du test".into())),
+        ]);
+        boucle(|| Ok(source), &mut decodeur, &sortie, &arret, &stats);
+
+        let vue = stats.instantane();
+        assert_eq!(vue.erreurs_decodage, 1);
+        assert_eq!(vue.unites_refusees, 0);
+        assert_eq!(vue.octets_recus, 128);
+        // La boucle a continué : la deuxième unité a été décodée.
+        assert_eq!(*decodeur.decodes.lock().expect("verrou"), 1);
+        // Codec et transport sont publiés pour l'overlay.
+        let infos = stats.infos();
+        assert_eq!(infos.codec.as_deref(), Some("factice"));
+        assert_eq!(infos.transport.as_deref(), Some("factice://"));
     }
 
     #[test]

@@ -2,8 +2,8 @@
 //!
 //! v0.1, étapes 1 à 3 : fenêtre SDL3, device Direct3D 11 unique, chaîne d'échange « flip »,
 //! réception UDP/SRT du MPEG-TS, décodage D3D11VA sans copie CPU, et affichage NV12 -> RGB
-//! en respectant le ratio. L'overlay F3 et la reconnexion automatique viennent à l'étape 4 ;
-//! pour l'instant les mesures sont journalisées une fois par seconde.
+//! en respectant le ratio. Étape 4 : overlay de stats (F3), dont les chiffres sont aussi
+//! résumés une fois par seconde dans le journal.
 
 mod config;
 mod render;
@@ -24,9 +24,10 @@ use crate::config::Config;
 use crate::render::d3d11::{Gpu, Pipeline, Presenter, RenderError, hwnd_de};
 use crate::render::letterbox::{Viewport, letterbox};
 use crate::render::nv12::Nv12Pool;
-use crate::stats::{Cadence, Stats};
+use crate::render::scene::Scene;
+use crate::stats::{Echantillonneur, Stats};
 use crate::video::avcodec_decoder::AvcodecD3d11Decoder;
-use crate::video::frame::{DecodedFrame, Mailbox, SlotIndex};
+use crate::video::frame::{DecodedFrame, Mailbox};
 use crate::video::lavf_source::LavfSource;
 use crate::video::thread::VideoThread;
 
@@ -43,9 +44,6 @@ const ATTENTE_PRESENTATION_MS: u32 = 100;
 /// Délai maximal d'attente d'une nouvelle image décodée. Court, pour continuer à traiter les
 /// événements de la fenêtre même quand le flux est muet.
 const ATTENTE_IMAGE_MS: u64 = 8;
-
-/// Période du résumé des mesures dans le journal.
-const PERIODE_MESURES: Duration = Duration::from_secs(1);
 
 fn main() -> ExitCode {
     regler_console_en_utf8();
@@ -109,11 +107,13 @@ fn executer() -> Result<()> {
     )
     .context("création de la chaîne d'échange")?;
 
+    let mut scene = Scene::nouveau(&gpu).context("préparation de l'overlay")?;
+
     let stats = Arc::new(Stats::new());
     // Tant que le flux n'est pas ouvert, on raisonne en 16:9 : la zone utile est déjà
     // calculée et les bandes noires visibles. Le thread vidéo corrigera la résolution.
     stats.enregistrer_resolution(1920, 1080);
-    let mut cadence_presentation = Cadence::new(0);
+    let mut echantillonneur = Echantillonneur::new(&stats, Instant::now());
 
     // Pool de textures NV12 + boîte aux lettres d'une place : c'est la frontière entre le
     // thread vidéo (qui copie et publie) et ce thread (qui dessine et présente).
@@ -144,13 +144,18 @@ fn executer() -> Result<()> {
         .map_err(anyhow::Error::msg)
         .context("création de la pompe d'événements")?;
     let mut overlay_visible = false;
+    // Texte de l'overlay, recalculé une fois par seconde.
+    let mut texte_stats = vec!["Mesures dans une seconde…".to_owned()];
     let mut souris_capturee = false;
-    // Emplacement NV12 actuellement à l'écran, libéré après la présentation suivante.
-    let mut slot_affiche: Option<SlotIndex> = None;
+    // Image actuellement à l'écran : son emplacement NV12 n'est libéré qu'après la
+    // présentation suivante, et elle est redessinée quand l'affichage change sans image neuve.
+    let mut image_affichee: Option<DecodedFrame> = None;
     // Image retirée de la boîte aux lettres mais pas encore présentée (la chaîne d'échange
     // n'était pas prête) : elle est conservée d'une itération à l'autre.
     let mut image_a_presenter: Option<DecodedFrame> = None;
-    let mut derniere_mesure = Instant::now();
+    // Vrai quand l'affichage doit changer sans nouvelle image (overlay, redimensionnement) :
+    // on représente alors l'image courante. Vrai au départ pour peindre le fond.
+    let mut a_redessiner = true;
 
     log::info!(
         "Fenêtre prête. Ctrl+Alt+Shift+Q quitter, Ctrl+Alt+Shift+Z souris, F3 stats, F11 plein écran."
@@ -173,6 +178,7 @@ fn executer() -> Result<()> {
                             return Err(anyhow::Error::new(erreur)
                                 .context("redimensionnement de la chaîne d'échange"));
                         }
+                        a_redessiner = true;
                     }
                     _ => {}
                 },
@@ -192,29 +198,10 @@ fn executer() -> Result<()> {
                         }
                         Some(Action::BasculerOverlay) => {
                             overlay_visible = !overlay_visible;
-                            log::info!(
-                                "Overlay de stats : {} (affichage à l'étape 4)",
+                            a_redessiner = true;
+                            log::debug!(
+                                "Overlay de stats {}",
                                 if overlay_visible { "affiché" } else { "masqué" }
-                            );
-                            let vue = stats.instantane();
-                            log::info!(
-                                "stats : présentées {} ({:.1}/s), reçues {}, décodées {}, \
-                                 jetées {}, refusées {} | décodage {} | \
-                                 réception -> présentation {}",
-                                vue.images_presentees,
-                                cadence_presentation.valeur(),
-                                vue.unites_recues,
-                                vue.images_decodees,
-                                vue.images_jetees,
-                                vue.unites_refusees,
-                                stats
-                                    .decodage
-                                    .consulter()
-                                    .map_or_else(|| "-".to_owned(), |r| r.en_millisecondes()),
-                                stats
-                                    .reception_presentation
-                                    .consulter()
-                                    .map_or_else(|| "-".to_owned(), |r| r.en_millisecondes())
                             );
                         }
                         Some(Action::BasculerCaptureSouris) => {
@@ -232,7 +219,15 @@ fn executer() -> Result<()> {
             }
         }
 
-        journaliser_mesures(&stats, &mut derniere_mesure, &cadence_presentation);
+        // Une fois par seconde : un seul échantillon pour l'overlay et le journal.
+        if let Some(echantillon) = echantillonneur.echantillonner(&stats, Instant::now()) {
+            let lignes = crate::stats::lignes(&echantillon);
+            if echantillon.actif() {
+                log::info!("stats | {}", crate::stats::ligne_journal(&lignes));
+            }
+            texte_stats = crate::stats::texte_overlay(&lignes);
+            a_redessiner |= overlay_visible;
+        }
 
         // Dernière image décodée, ou rien si le flux est muet. Règle 3 : la boîte aux
         // lettres ne rend que la plus récente.
@@ -240,13 +235,13 @@ fn executer() -> Result<()> {
             image_a_presenter = boite.attendre_et_retirer(Duration::from_millis(ATTENTE_IMAGE_MS));
         }
 
-        // Rien de neuf : on garde ce qui est déjà à l'écran plutôt que de présenter une
-        // image identique, ce qui économise le GPU et ne change rien à l'affichage.
-        let Some(image) = image_a_presenter else {
+        // Rien de neuf et rien à changer à l'écran : on garde ce qui y est déjà plutôt que de
+        // présenter une image identique, ce qui économise le GPU.
+        if image_a_presenter.is_none() && !a_redessiner {
             continue;
-        };
+        }
 
-        // L'attente de la chaîne d'échange ne vient qu'*après* avoir une image à montrer.
+        // L'attente de la chaîne d'échange ne vient qu'*après* avoir quelque chose à montrer.
         // L'objet de latence est à réarmement automatique : l'attendre sans présenter
         // consomme le signal, et plus rien ne le réarme avant le `Present` suivant. La
         // boucle resterait alors bloquée tant que le flux est muet.
@@ -257,39 +252,50 @@ fn executer() -> Result<()> {
 
         // La chaîne d'échange était peut-être prête depuis un moment : s'il y a plus récent,
         // on l'affiche à la place (règle 3) et on recycle l'emplacement abandonné.
-        let image = match boite.retirer() {
-            Some(plus_recente) => {
-                pool.liberer(image.slot);
+        let nouvelle = match (image_a_presenter.take(), boite.retirer()) {
+            (Some(ancienne), Some(plus_recente)) => {
+                pool.liberer(ancienne.slot);
                 stats.compter_image_jetee();
-                plus_recente
+                Some(plus_recente)
             }
-            None => image,
+            (image, None) => image,
+            (None, plus_recente) => plus_recente,
         };
-        image_a_presenter = None;
 
-        let zone: Viewport = letterbox(presenter.taille(), (image.width, image.height));
+        // Image neuve, sinon celle déjà à l'écran (redessin), sinon le fond seul.
+        let a_dessiner = nouvelle.or(image_affichee);
 
         presenter.effacer(&gpu, COULEUR_FOND);
-        match pool.vues(image.slot) {
-            Some((luma, chroma)) => presenter.dessiner(&gpu, &pipeline, (&luma, &chroma), zone),
-            // L'emplacement a disparu (réallocation pour un changement de résolution) :
-            // on présente le fond, l'image suivante sera correcte.
-            None => log::debug!("Emplacement {} introuvable au moment du rendu.", image.slot),
+        if let Some(image) = a_dessiner {
+            let zone: Viewport = letterbox(presenter.taille(), (image.width, image.height));
+            match pool.vues(image.slot) {
+                Some((luma, chroma)) => {
+                    presenter.dessiner(&gpu, &pipeline, (&luma, &chroma), zone);
+                }
+                // L'emplacement a disparu (réallocation pour un changement de résolution) :
+                // on présente le fond, l'image suivante sera correcte.
+                None => log::debug!("Emplacement {} introuvable au moment du rendu.", image.slot),
+            }
         }
+        scene.dessiner(&gpu, &presenter, overlay_visible.then_some(texte_stats.as_slice()));
 
         let resultat = presenter.presenter();
+        a_redessiner = false;
 
-        // L'emplacement de l'image *précédente* n'est rendu qu'ici : la présentation qu'on
-        // vient d'attendre garantit que le GPU a fini de la lire. Sans ce décalage d'une
-        // image, le décodeur pourrait réécrire une texture encore en cours de lecture.
-        if let Some(precedente) = slot_affiche.replace(image.slot) {
-            pool.liberer(precedente);
+        if let Some(image) = nouvelle {
+            // L'emplacement de l'image *précédente* n'est rendu qu'ici : la présentation
+            // qu'on vient d'attendre garantit que le GPU a fini de la lire. Sans ce décalage
+            // d'une image, le décodeur pourrait réécrire une texture encore en lecture.
+            if let Some(precedente) = image_affichee.replace(image) {
+                pool.liberer(precedente.slot);
+            }
         }
 
         match resultat {
             Ok(()) => {
-                stats.compter_image_presentee(image.duree_jusqu_a(Instant::now()));
-                cadence_presentation.echantillonner(stats.instantane().images_presentees);
+                if let Some(image) = nouvelle {
+                    stats.compter_image_presentee(image.duree_jusqu_a(Instant::now()));
+                }
             }
             Err(RenderError::Api { operation, source }) => {
                 // Une présentation qui échoue durablement signifie device perdu : on sort
@@ -309,36 +315,6 @@ fn executer() -> Result<()> {
     boite.arreter();
     thread_video.arreter();
     Ok(())
-}
-
-/// Journalise une fois par seconde les mesures qui serviront à comparer avec mpv.
-///
-/// `Agregat::vider` remet les compteurs à zéro : la moyenne et le maximum portent donc bien
-/// sur la seconde écoulée, et non depuis le démarrage.
-fn journaliser_mesures(stats: &Stats, derniere: &mut Instant, cadence: &Cadence) {
-    if derniere.elapsed() < PERIODE_MESURES {
-        return;
-    }
-    *derniere = Instant::now();
-
-    let decodage = stats.decodage.vider();
-    let bout_en_bout = stats.reception_presentation.vider();
-    if decodage.is_none() && bout_en_bout.is_none() {
-        return;
-    }
-
-    let vue = stats.instantane();
-    log::info!(
-        "image : {:.1} présentées/s, {}x{} | décodage {} | réception -> présentation {} | décodées {}, jetées {}, refusées {}",
-        cadence.valeur(),
-        vue.largeur,
-        vue.hauteur,
-        decodage.map_or_else(|| "-".to_owned(), |r| r.en_millisecondes()),
-        bout_en_bout.map_or_else(|| "-".to_owned(), |r| r.en_millisecondes()),
-        vue.images_decodees,
-        vue.images_jetees,
-        vue.unites_refusees
-    );
 }
 
 /// Passe la console en UTF-8, sinon les accents des journaux sont illisibles : Rust écrit
