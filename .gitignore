@@ -12,3 +12,10 @@
 
 # Réglages Claude Code personnels
 /.claude/settings.local.json
+
+# Appli ORBIT (Tauri + React) et scripts Python
+node_modules/
+/orbit/dist/
+/orbit/src-tauri/target/
+__pycache__/
+*.pyc
