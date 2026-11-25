@@ -24,7 +24,7 @@ use crate::config::Config;
 use crate::render::d3d11::{Gpu, Pipeline, Presenter, RenderError, hwnd_de};
 use crate::render::letterbox::{Viewport, letterbox};
 use crate::render::nv12::Nv12Pool;
-use crate::render::scene::Scene;
+use crate::render::scene::{DELAI_SIGNAL_PERDU, EtatSignal, Scene, SuiviSignal};
 use crate::stats::{Echantillonneur, Stats};
 use crate::video::avcodec_decoder::AvcodecD3d11Decoder;
 use crate::video::frame::{DecodedFrame, Mailbox};
@@ -156,6 +156,9 @@ fn executer() -> Result<()> {
     // Vrai quand l'affichage doit changer sans nouvelle image (overlay, redimensionnement) :
     // on représente alors l'image courante. Vrai au départ pour peindre le fond.
     let mut a_redessiner = true;
+    // « En attente du flux… » puis « Signal perdu » après 2 s sans image.
+    let mut suivi_signal = SuiviSignal::nouveau();
+    let mut etat_affiche = EtatSignal::EnAttente;
 
     log::info!(
         "Fenêtre prête. Ctrl+Alt+Shift+Q quitter, Ctrl+Alt+Shift+Z souris, F3 stats, F11 plein écran."
@@ -229,6 +232,14 @@ fn executer() -> Result<()> {
             a_redessiner |= overlay_visible;
         }
 
+        // Le bandeau change même sans image : c'est justement l'absence d'image qu'il signale.
+        let etat = suivi_signal.etat(Instant::now());
+        if etat != etat_affiche {
+            journaliser_signal(etat_affiche, etat);
+            etat_affiche = etat;
+            a_redessiner = true;
+        }
+
         // Dernière image décodée, ou rien si le flux est muet. Règle 3 : la boîte aux
         // lettres ne rend que la plus récente.
         if image_a_presenter.is_none() {
@@ -264,6 +275,14 @@ fn executer() -> Result<()> {
 
         // Image neuve, sinon celle déjà à l'écran (redessin), sinon le fond seul.
         let a_dessiner = nouvelle.or(image_affichee);
+        if nouvelle.is_some() {
+            suivi_signal.image_recue(Instant::now());
+            let etat = suivi_signal.etat(Instant::now());
+            if etat != etat_affiche {
+                journaliser_signal(etat_affiche, etat);
+                etat_affiche = etat;
+            }
+        }
 
         presenter.effacer(&gpu, COULEUR_FOND);
         if let Some(image) = a_dessiner {
@@ -277,7 +296,12 @@ fn executer() -> Result<()> {
                 None => log::debug!("Emplacement {} introuvable au moment du rendu.", image.slot),
             }
         }
-        scene.dessiner(&gpu, &presenter, overlay_visible.then_some(texte_stats.as_slice()));
+        scene.dessiner(
+            &gpu,
+            &presenter,
+            overlay_visible.then_some(texte_stats.as_slice()),
+            etat_affiche,
+        );
 
         let resultat = presenter.presenter();
         a_redessiner = false;
@@ -315,6 +339,20 @@ fn executer() -> Result<()> {
     boite.arreter();
     thread_video.arreter();
     Ok(())
+}
+
+/// Trace les changements d'état du signal : ce sont les moments à retrouver dans le journal
+/// après une coupure.
+fn journaliser_signal(avant: EtatSignal, apres: EtatSignal) {
+    match (avant, apres) {
+        (_, EtatSignal::Perdu) => log::warn!(
+            "Signal perdu : aucune image depuis {} s, la dernière reste affichée.",
+            DELAI_SIGNAL_PERDU.as_secs()
+        ),
+        (EtatSignal::EnAttente, EtatSignal::Recu) => log::info!("Première image affichée."),
+        (EtatSignal::Perdu, EtatSignal::Recu) => log::info!("Signal rétabli."),
+        _ => {}
+    }
 }
 
 /// Passe la console en UTF-8, sinon les accents des journaux sont illisibles : Rust écrit

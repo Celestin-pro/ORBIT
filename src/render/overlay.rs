@@ -138,6 +138,8 @@ pub struct RenduCalques {
     echantillonneur: ID3D11SamplerState,
     melange: ID3D11BlendState,
     constantes: ID3D11Buffer,
+    /// Masque d'un pixel de fond, pour assombrir sans texte.
+    vide: ID3D11ShaderResourceView,
 }
 
 impl RenduCalques {
@@ -226,8 +228,9 @@ impl RenduCalques {
             )
         };
 
+        let vide = charger_masque(gpu, &Masque::vide())?;
         log::debug!("Rendu des calques de texte prêt (police 8x8, mélange alpha).");
-        Ok(Self { vertex, pixel, echantillonneur, melange, constantes })
+        Ok(Self { vertex, pixel, echantillonneur, melange, constantes, vide })
     }
 
     /// Dessine `calque` dans `zone`. Sans effet si le calque n'a jamais reçu de texte.
@@ -242,6 +245,12 @@ impl RenduCalques {
         if let Some(vue) = calque.vue.as_ref() {
             self.tracer(gpu, presenter, vue, zone, couleurs);
         }
+    }
+
+    /// Assombrit `zone` d'un voile noir d'opacité `opacite` (0 = rien, 1 = noir).
+    pub fn assombrir(&self, gpu: &Gpu, presenter: &Presenter, zone: Viewport, opacite: f32) {
+        let voile = [0.0, 0.0, 0.0, opacite.clamp(0.0, 1.0)];
+        self.tracer(gpu, presenter, &self.vide, zone, Couleurs { fond: voile, encre: voile });
     }
 
     fn tracer(

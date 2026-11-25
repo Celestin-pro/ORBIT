@@ -129,6 +129,33 @@ pub fn placer_en_haut_a_gauche(masque: (u32, u32), echelle: u32) -> Viewport {
     }
 }
 
+/// Zone d'un bandeau centré dans la fenêtre, agrandi au plus de `echelle_max`.
+///
+/// L'échelle est réduite tant que le bandeau dépasse de la fenêtre (petite fenêtre) ; à
+/// l'échelle 1, il est centré quoi qu'il arrive, quitte à déborder.
+pub fn placer_au_centre(masque: (u32, u32), fenetre: (u32, u32), echelle_max: u32) -> Viewport {
+    let mut echelle = echelle_max.max(1);
+    while echelle > 1
+        && (masque.0 * echelle + 2 * ECART_BORD > fenetre.0
+            || masque.1 * echelle + 2 * ECART_BORD > fenetre.1)
+    {
+        echelle -= 1;
+    }
+    let largeur = masque.0 * echelle;
+    let hauteur = masque.1 * echelle;
+    Viewport {
+        x: fenetre.0.saturating_sub(largeur) / 2,
+        y: fenetre.1.saturating_sub(hauteur) / 2,
+        width: largeur,
+        height: hauteur,
+    }
+}
+
+/// Zone couvrant toute la fenêtre (assombrissement).
+pub fn plein_ecran(fenetre: (u32, u32)) -> Viewport {
+    Viewport { x: 0, y: 0, width: fenetre.0, height: fenetre.1 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,5 +247,27 @@ mod tests {
     fn l_overlay_est_en_haut_a_gauche() {
         let zone = placer_en_haut_a_gauche((100, 50), 2);
         assert_eq!(zone, Viewport { x: ECART_BORD, y: ECART_BORD, width: 200, height: 100 });
+    }
+
+    #[test]
+    fn le_bandeau_est_centre() {
+        let zone = placer_au_centre((100, 20), (1280, 720), 4);
+        assert_eq!((zone.width, zone.height), (400, 80));
+        assert_eq!((zone.x, zone.y), (440, 320));
+    }
+
+    #[test]
+    fn le_bandeau_retrecit_dans_une_petite_fenetre() {
+        // 100 x 4 = 400 ne tient pas dans 300 : l'échelle descend à 2 (200 + 2 x 10 <= 300).
+        let zone = placer_au_centre((100, 20), (300, 200), 4);
+        assert_eq!(zone.width, 200);
+        // Fenêtre minuscule : échelle 1, centré, sans débordement arithmétique.
+        let zone = placer_au_centre((100, 20), (50, 10), 4);
+        assert_eq!((zone.x, zone.y, zone.width), (0, 0, 100));
+    }
+
+    #[test]
+    fn le_plein_ecran_couvre_la_fenetre() {
+        assert_eq!(plein_ecran((1280, 720)), Viewport { x: 0, y: 0, width: 1280, height: 720 });
     }
 }
