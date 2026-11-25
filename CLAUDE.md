@@ -241,8 +241,17 @@ ancien) : ignorés. Accepter uniquement les paquets venant de `--host`.
 - Le player est embarqué dans l'installeur Tauri (ressource) avec ses DLL.
 
 ### Plus tard (ne pas commencer sans demande)
-- Canal retour : demande d'image clé à l'hôte après perte (nécessite un changement côté hôte).
-- Correction d'erreurs (FEC), débit adaptatif, protocole vidéo maison à la place de MPEG-TS.
+- **Protocole vidéo ORBIT** (remplace MPEG-TS sur UDP brut ; `OrbitProtocolSource`, changement
+  côté hôte requis). Constat terrain qui le motive : en UDP brut sur Wi-Fi, 1080p à 20 Mbit/s,
+  les ~30 paquets UDP d'une image partent en rafale -> pertes massives (15 à 25 images/s reçues
+  sur 60, erreurs « Packet corrupt » du démultiplexeur). Ce protocole doit **obligatoirement** :
+  1. **Étaler l'envoi (pacing)** : répartir les paquets d'une image sur l'intervalle entre deux
+     images (≈ 16,7 ms à 60 i/s) au lieu de les envoyer en rafale.
+  2. **FEC Reed-Solomon par image** : paquets de redondance calculés sur les paquets de chaque
+     image, pour reconstruire les paquets perdus sans retransmission.
+  3. **Canal retour** client -> hôte : demander une image clé quand une image reste
+     irrécupérable malgré la FEC.
+- Débit adaptatif.
 - HDR, multi-écran, décodage logiciel de secours.
 
 ---
