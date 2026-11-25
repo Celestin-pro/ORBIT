@@ -31,10 +31,30 @@ pub enum EtatSignal {
     Perdu,
 }
 
+/// Après une perte, les images doivent arriver sans interruption pendant au moins cette
+/// durée pour que le signal soit déclaré rétabli.
+///
+/// Quelques images ne prouvent rien : quand le flux se coupe, le démultiplexeur MPEG-TS livre
+/// d'un coup ce qu'il retenait (un paquet n'est complet qu'au début du suivant) au moment où
+/// la coupure est détectée, donc *après* la perte. Cette rafale dure quelques millisecondes ;
+/// un vrai flux, lui, continue. Les images de la rafale s'affichent, mais assombries.
+pub const DUREE_CONFIRMATION: Duration = Duration::from_millis(100);
+
+/// Écart maximal entre deux images d'une reprise : au-delà, la reprise recommence à zéro.
+pub const ECART_MAX_REPRISE: Duration = Duration::from_millis(500);
+
+/// Reprise en cours d'observation après une perte.
+#[derive(Debug, Clone, Copy)]
+struct Reprise {
+    debut: Instant,
+    derniere: Instant,
+}
+
 /// Date de la dernière image affichée, et l'état qui s'en déduit.
 #[derive(Debug, Default)]
 pub struct SuiviSignal {
     derniere_image: Option<Instant>,
+    reprise: Option<Reprise>,
 }
 
 impl SuiviSignal {
@@ -44,7 +64,22 @@ impl SuiviSignal {
 
     /// À appeler pour chaque nouvelle image présentée.
     pub fn image_recue(&mut self, quand: Instant) {
-        self.derniere_image = Some(quand);
+        if self.etat(quand) != EtatSignal::Perdu {
+            self.derniere_image = Some(quand);
+            return;
+        }
+        let reprise = match self.reprise {
+            Some(r) if quand.saturating_duration_since(r.derniere) <= ECART_MAX_REPRISE => {
+                Reprise { derniere: quand, ..r }
+            }
+            _ => Reprise { debut: quand, derniere: quand },
+        };
+        if quand.saturating_duration_since(reprise.debut) >= DUREE_CONFIRMATION {
+            self.derniere_image = Some(quand);
+            self.reprise = None;
+        } else {
+            self.reprise = Some(reprise);
+        }
     }
 
     pub fn etat(&self, maintenant: Instant) -> EtatSignal {
@@ -162,8 +197,45 @@ mod tests {
         let plus_tard = debut + Duration::from_secs(5);
         assert_eq!(suivi.etat(plus_tard), EtatSignal::Perdu);
 
-        suivi.image_recue(plus_tard);
-        assert_eq!(suivi.etat(plus_tard + Duration::from_millis(16)), EtatSignal::Recu);
+        // Un flux à 60 images/s : il faut 100 ms d'images continues pour lever le voile.
+        let mut t = plus_tard;
+        for _ in 0..6 {
+            suivi.image_recue(t);
+            assert_eq!(suivi.etat(t), EtatSignal::Perdu, "reprise pas encore confirmée");
+            t += Duration::from_micros(16_667);
+        }
+        suivi.image_recue(t);
+        assert_eq!(suivi.etat(t), EtatSignal::Recu);
+    }
+
+    #[test]
+    fn une_rafale_pendant_la_perte_ne_retablit_pas_le_signal() {
+        let mut suivi = SuiviSignal::nouveau();
+        let debut = Instant::now();
+        suivi.image_recue(debut);
+
+        // Images retenues par le démultiplexeur, livrées d'un coup à la détection de la
+        // coupure : trois images en 2 ms.
+        let rafale = debut + Duration::from_secs(3);
+        for ms in 0..3 {
+            suivi.image_recue(rafale + Duration::from_millis(ms));
+        }
+        assert_eq!(suivi.etat(rafale + Duration::from_millis(3)), EtatSignal::Perdu);
+
+        // Le vrai flux revient bien plus tard : la reprise repart de zéro, puis se confirme.
+        let retour = rafale + Duration::from_secs(5);
+        suivi.image_recue(retour);
+        assert_eq!(suivi.etat(retour), EtatSignal::Perdu);
+        suivi.image_recue(retour + DUREE_CONFIRMATION);
+        assert_eq!(suivi.etat(retour + DUREE_CONFIRMATION), EtatSignal::Recu);
+    }
+
+    #[test]
+    fn la_premiere_image_suffit_au_demarrage() {
+        let mut suivi = SuiviSignal::nouveau();
+        let debut = Instant::now();
+        suivi.image_recue(debut);
+        assert_eq!(suivi.etat(debut), EtatSignal::Recu);
     }
 
     #[test]

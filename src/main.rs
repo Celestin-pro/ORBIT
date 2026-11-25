@@ -130,8 +130,9 @@ fn executer() -> Result<()> {
     let arret_video = Arc::new(AtomicBool::new(false));
     let url_video = config.url_video();
     let arret_source = Arc::clone(&arret_video);
-    let thread_video = VideoThread::demarrer(
-        move || LavfSource::ouvrir(&url_video, arret_source),
+    let mut thread_video = VideoThread::demarrer(
+        // Appelée à chaque tentative d'ouverture, tant que le flux n'est pas là.
+        move || LavfSource::ouvrir(&url_video, Arc::clone(&arret_source)),
         Box::new(decodeur),
         Arc::clone(&pool) as Arc<dyn crate::video::decoder::FrameSink>,
         arret_video,
@@ -222,6 +223,14 @@ fn executer() -> Result<()> {
             }
         }
 
+        // Le thread vidéo ne s'arrête de lui-même que sur erreur fatale (décodeur matériel
+        // indisponible, codec non pris en charge) : on ferme avec un message clair plutôt
+        // que de laisser une fenêtre figée. Code de sortie non nul pour bridge.py.
+        if let Some(erreur) = thread_video.erreur_fatale() {
+            boite.arreter();
+            anyhow::bail!("vidéo : {erreur}");
+        }
+
         // Une fois par seconde : un seul échantillon pour l'overlay et le journal.
         if let Some(echantillon) = echantillonneur.echantillonner(&stats, Instant::now()) {
             let lignes = crate::stats::lignes(&echantillon);
@@ -275,7 +284,13 @@ fn executer() -> Result<()> {
 
         // Image neuve, sinon celle déjà à l'écran (redessin), sinon le fond seul.
         let a_dessiner = nouvelle.or(image_affichee);
-        if nouvelle.is_some() {
+        if let Some(image) = nouvelle {
+            // La taille décodée fait foi : la source peut annoncer 0x0 quand elle rejoint un
+            // flux en cours sans avoir vu de SPS.
+            let vue = stats.instantane();
+            if (vue.largeur, vue.hauteur) != (image.width, image.height) {
+                stats.enregistrer_resolution(image.width, image.height);
+            }
             suivi_signal.image_recue(Instant::now());
             let etat = suivi_signal.etat(Instant::now());
             if etat != etat_affiche {

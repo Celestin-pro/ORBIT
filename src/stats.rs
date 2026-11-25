@@ -156,6 +156,10 @@ impl Stats {
         self.erreurs_decodage.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn compter_reconnexion(&self) {
+        self.reconnexions.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn compter_image_decodee(&self, duree: Duration) {
         self.images_decodees.fetch_add(1, Ordering::Relaxed);
         self.decodage.ajouter(duree);
@@ -170,7 +174,12 @@ impl Stats {
         self.images_jetees.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Une résolution nulle (inconnue : la source a rejoint un flux en cours sans voir de
+    /// SPS) n'efface pas la précédente ; la taille de l'image décodée la corrigera.
     pub fn enregistrer_resolution(&self, largeur: u32, hauteur: u32) {
+        if largeur == 0 || hauteur == 0 {
+            return;
+        }
         self.largeur.store(largeur, Ordering::Relaxed);
         self.hauteur.store(hauteur, Ordering::Relaxed);
     }
@@ -381,6 +390,11 @@ mod tests {
         assert_eq!(vue.unites_refusees, 1);
         assert_eq!(vue.erreurs_decodage, 1);
         assert_eq!(vue.reconnexions, 1);
+        assert_eq!((vue.largeur, vue.hauteur), (1920, 1080));
+
+        // Une résolution inconnue n'efface pas la dernière connue.
+        stats.enregistrer_resolution(0, 0);
+        let vue = stats.instantane();
         assert_eq!((vue.largeur, vue.hauteur), (1920, 1080));
     }
 

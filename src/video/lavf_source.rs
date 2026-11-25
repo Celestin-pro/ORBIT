@@ -111,9 +111,9 @@ impl LavfSource {
         };
 
         // En UDP comme en SRT, `avformat_open_input` ne rend la main qu'une fois assez de
-        // données reçues pour identifier le flux : sans cette ligne, rien n'apparaîtrait
-        // dans le journal tant que le PC fixe n'émet pas.
-        log::info!("Ouverture de l'entrée {} : attente du flux…", source.description());
+        // données reçues pour identifier le flux (ou au délai de silence). Le thread vidéo
+        // réessaie en boucle : le détail de chaque tentative ne sert qu'au débogage.
+        log::debug!("Ouverture de l'entrée {} : attente du flux…", source.description());
 
         source.ouvrir_entree()?;
         Ok(source)
@@ -360,7 +360,7 @@ impl VideoSource for LavfSource {
     }
 
     fn reconnect(&mut self) -> Result<(), SourceError> {
-        log::info!("Réouverture de l'entrée {}", self.url);
+        log::debug!("Réouverture de l'entrée {}", self.url);
         self.ouvrir_entree()
     }
 
@@ -541,6 +541,181 @@ mod tests {
         let resultat = LavfSource::ouvrir("udp://127.0.0.1:59999?timeout=5000000", arret);
         assert!(resultat.is_err(), "l'ouverture devait être interrompue");
         assert!(debut.elapsed() < std::time::Duration::from_secs(3), "interruption trop lente");
+    }
+
+    // ------------------------------------------------------------------------------------
+    // Délai de silence et coupures, sur de vrais sockets.
+    //
+    // Ces tests vérifient ce que la doc de `config::DELAI_SILENCE_US` affirme : sans l'option
+    // `timeout` de l'URL, une entrée muette bloquerait indéfiniment et la reconnexion
+    // n'aurait jamais lieu. Les deux tests de coupure émettent une vraie mire avec le
+    // `ffmpeg.exe` LGPL de `third_party/ffmpeg` (libopenh264) ; ils sont sautés s'il manque.
+    // ------------------------------------------------------------------------------------
+
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    /// `ffmpeg.exe` du build LGPL téléchargé par `scripts/setup.ps1`, s'il est là.
+    fn ffmpeg_exe() -> Option<std::path::PathBuf> {
+        let chemin = std::path::Path::new(option_env!("FFMPEG_DIR")?).join("bin/ffmpeg.exe");
+        chemin.exists().then_some(chemin)
+    }
+
+    /// Lance une petite mire H.264 vers `destination` (MPEG-TS), pendant `duree_s` secondes.
+    fn lancer_mire(ffmpeg: &std::path::Path, destination: &str, duree_s: u32) -> Child {
+        Command::new(ffmpeg)
+            .args(["-hide_banner", "-loglevel", "error", "-re", "-f", "lavfi", "-i"])
+            .arg("testsrc2=size=320x240:rate=30")
+            .args(["-t", &duree_s.to_string(), "-c:v", "libopenh264", "-g", "15"])
+            .args(["-f", "mpegts", destination])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("lancement de ffmpeg.exe")
+    }
+
+    /// Ouvre `url` en réessayant (ffmpeg met un moment à démarrer), comme le thread vidéo.
+    fn ouvrir_avec_patience(url: &str) -> LavfSource {
+        let debut = Instant::now();
+        loop {
+            match LavfSource::ouvrir(url, Arc::new(AtomicBool::new(false))) {
+                Ok(source) => return source,
+                Err(erreur) if debut.elapsed() < Duration::from_secs(15) => {
+                    eprintln!("ouverture en attente : {erreur}");
+                }
+                Err(erreur) => panic!("le flux de test n'est jamais arrivé : {erreur}"),
+            }
+        }
+    }
+
+    /// Lit jusqu'à la première erreur ; renvoie (unités lues, erreur, instant de la dernière
+    /// unité, instant de l'erreur). `apres_n` est appelé une fois, après `n` unités.
+    fn lire_jusqu_a_l_erreur(
+        source: &mut LavfSource,
+        n: u32,
+        mut apres_n: impl FnMut(),
+    ) -> (u32, SourceError, Instant, Instant) {
+        let mut unite = AccessUnit::vide();
+        let mut lues = 0;
+        let mut derniere = Instant::now();
+        loop {
+            match source.next_access_unit(&mut unite) {
+                Ok(()) => {
+                    lues += 1;
+                    derniere = Instant::now();
+                    if lues == n {
+                        apres_n();
+                    }
+                }
+                Err(erreur) => return (lues, erreur, derniere, Instant::now()),
+            }
+            assert!(lues < 10_000, "la lecture ne s'arrête jamais");
+        }
+    }
+
+    #[test]
+    fn une_entree_udp_muette_echoue_dans_le_delai_de_silence() {
+        // Sans `timeout`, cette ouverture bloquerait jusqu'à ce qu'on lève le drapeau.
+        let debut = Instant::now();
+        let resultat = LavfSource::ouvrir(
+            "udp://127.0.0.1:59981?fifo_size=5000000&overrun_nonfatal=1&timeout=500000",
+            Arc::new(AtomicBool::new(false)),
+        );
+        let ecoule = debut.elapsed();
+        assert!(
+            matches!(resultat, Err(SourceError::Ouverture { .. })),
+            "attendu une erreur d'ouverture"
+        );
+        assert!(ecoule < Duration::from_secs(3), "délai de silence ignoré ({ecoule:?})");
+    }
+
+    #[test]
+    fn une_coupure_udp_remonte_flux_interrompu_dans_le_delai() {
+        let Some(ffmpeg) = ffmpeg_exe() else {
+            eprintln!("ffmpeg.exe absent de third_party : test sauté");
+            return;
+        };
+        let mut mire = lancer_mire(&ffmpeg, "udp://127.0.0.1:59982?pkt_size=1316", 3);
+        // On date la fin de l'émission : la dernière unité, elle, n'est livrée par le
+        // démultiplexeur MPEG-TS qu'au moment de l'erreur (un paquet n'est complet qu'au
+        // début du suivant), elle ne peut donc pas servir de repère.
+        let fin_mire = std::thread::spawn(move || {
+            let _ = mire.wait();
+            Instant::now()
+        });
+        let mut source = ouvrir_avec_patience(
+            "udp://127.0.0.1:59982?fifo_size=5000000&overrun_nonfatal=1&timeout=1000000",
+        );
+
+        // La mire s'arrête seule après 3 s : on doit ensuite obtenir FluxInterrompu (et non
+        // un blocage) environ une seconde plus tard.
+        let (lues, erreur, _, fin) = lire_jusqu_a_l_erreur(&mut source, 0, || {});
+        let fin_mire = fin_mire.join().expect("attente de la mire");
+
+        assert!(lues >= 10, "trop peu d'unités reçues ({lues})");
+        assert!(matches!(erreur, SourceError::FluxInterrompu(_)), "erreur inattendue : {erreur}");
+        assert!(fin > fin_mire, "erreur avant la fin de l'émission : {erreur}");
+        let silence = fin - fin_mire;
+        assert!(
+            silence >= Duration::from_millis(500) && silence < Duration::from_secs(4),
+            "coupure détectée après {silence:?} au lieu d'environ 1 s"
+        );
+        eprintln!("coupure UDP détectée {silence:?} après la fin de l'émission ({erreur})");
+    }
+
+    #[test]
+    fn une_coupure_srt_brutale_remonte_flux_interrompu_dans_le_delai() {
+        let Some(ffmpeg) = ffmpeg_exe() else {
+            eprintln!("ffmpeg.exe absent de third_party : test sauté");
+            return;
+        };
+        // Le portable écoute, la mire appelle, comme en production.
+        let mut mire = lancer_mire(
+            &ffmpeg,
+            "srt://127.0.0.1:59983?mode=caller&transtype=live&latency=40000",
+            20,
+        );
+        let mut source = ouvrir_avec_patience(
+            "srt://127.0.0.1:59983?mode=listener&transtype=live&latency=40000&timeout=1000000",
+        );
+
+        // On tue l'émetteur sans lui laisser fermer la connexion : c'est le cas d'un PC fixe
+        // qui plante ou d'un câble débranché. SRT seul ne s'en apercevrait qu'au bout de
+        // son propre délai (5 s) ; avec `timeout`, la lecture doit échouer vers 1 s.
+        let mut tue_a = None;
+        let (lues, erreur, _, fin) = lire_jusqu_a_l_erreur(&mut source, 20, || {
+            let _ = mire.kill();
+            tue_a = Some(Instant::now());
+        });
+        let _ = mire.wait();
+        let tue_a = tue_a.expect("la mire a bien été arrêtée");
+
+        assert!(lues >= 20, "trop peu d'unités reçues ({lues})");
+        assert!(matches!(erreur, SourceError::FluxInterrompu(_)), "erreur inattendue : {erreur}");
+        let delai = fin - tue_a;
+        assert!(delai < Duration::from_secs(4), "coupure SRT détectée après {delai:?}");
+        eprintln!("coupure SRT détectée {delai:?} après l'arrêt de l'émetteur");
+    }
+
+    #[test]
+    fn l_arret_interrompt_l_ecoute_srt() {
+        // En mode listener, l'attente d'un appelant n'a pas de délai : seul le drapeau
+        // d'arrêt doit pouvoir y mettre fin (fermeture de la fenêtre avant tout flux).
+        let arret = Arc::new(AtomicBool::new(false));
+        let copie = Arc::clone(&arret);
+        let fil = std::thread::spawn(move || {
+            LavfSource::ouvrir(
+                "srt://127.0.0.1:59984?mode=listener&transtype=live&timeout=1000000",
+                copie,
+            )
+            .is_err()
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        let debut = Instant::now();
+        arret.store(true, Ordering::Relaxed);
+        assert!(fil.join().expect("le fil d'écoute doit se terminer"), "ouverture interrompue");
+        assert!(debut.elapsed() < Duration::from_secs(2), "interruption trop lente");
     }
 
     #[test]
