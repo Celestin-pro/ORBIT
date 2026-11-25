@@ -134,7 +134,7 @@ fn run(args: Args) -> std::io::Result<()> {
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
                 Err(e) => {
-                    eprintln!("réception : {e}");
+                    println!("réception : {e}");
                     return;
                 }
             }
@@ -167,7 +167,7 @@ fn run(args: Args) -> std::io::Result<()> {
         let d = feedback::encode(seq, m);
         seq = seq.wrapping_add(1);
         if let Err(e) = retour.send_to(&d, dest_retour) {
-            eprintln!("envoi du retour : {e}");
+            println!("envoi du retour : {e}");
         }
     };
 
@@ -227,7 +227,7 @@ fn run(args: Args) -> std::io::Result<()> {
                     }
                 }
                 Event::Lost { frame_id } => {
-                    eprintln!("image {frame_id} perdue");
+                    println!("image {frame_id} perdue");
                     trace.report(frame_id, "perdue");
                 }
             }
@@ -266,7 +266,7 @@ fn bind_large_buffer(port: u16) -> std::io::Result<UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
     let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     if let Err(e) = s.set_recv_buffer_size(8 * 1024 * 1024) {
-        eprintln!("tampon de réception de 8 Mo refusé : {e}");
+        println!("tampon de réception de 8 Mo refusé : {e}");
     }
     s.bind(&SocketAddr::from(([0, 0, 0, 0], port)).into())?;
     Ok(s.into())
@@ -307,14 +307,14 @@ impl LossTrace {
             return;
         }
         let Some((cle, blocs, _)) = self.frames.get(&frame_id) else {
-            eprintln!("  image {frame_id} {quoi} : aucun fragment reçu");
+            println!("  image {frame_id} {quoi} : aucun fragment reçu");
             return;
         };
         for (b, frag) in blocs.iter().enumerate() {
             let manquants: Vec<usize> =
                 frag.iter().enumerate().filter(|(_, r)| !**r).map(|(i, _)| i).collect();
             if !manquants.is_empty() || frag.is_empty() {
-                eprintln!(
+                println!(
                     "  image {frame_id}{} {quoi} : bloc {b}, {} fragments, manquants {:?}",
                     if *cle { " (clé)" } else { "" },
                     frag.len(),

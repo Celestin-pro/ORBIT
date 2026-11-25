@@ -37,6 +37,8 @@ use crate::pipeline::{SenderSettings, Shared, SplitterSettings};
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format_timestamp_millis()
+        // Sur stdout : `orbit-sender ... | Tee-Object x.log` fonctionne tel quel sous PowerShell.
+        .target(env_logger::Target::Stdout)
         .init();
     match run(Config::parse()) {
         Ok(()) => {}
