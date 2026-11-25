@@ -57,6 +57,83 @@ def call(hid, method, path, body=None, timeout=10):
         raise HTTPException(503, f"PC fixe injoignable : {e}")
 
 
+# ======================================================== lecteur vidéo
+def _fresh_path():
+    """PATH relu dans le registre : un logiciel installé APRÈS l'ouverture du terminal
+    (ou de l'appli) n'apparaît pas dans le PATH hérité par ce processus."""
+    parts = [os.environ.get("PATH", "")]
+    if WINDOWS:
+        import winreg
+        for root, key in ((winreg.HKEY_LOCAL_MACHINE,
+                           r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"),
+                          (winreg.HKEY_CURRENT_USER, r"Environment")):
+            try:
+                with winreg.OpenKey(root, key) as k:
+                    parts.append(os.path.expandvars(winreg.QueryValueEx(k, "Path")[0]))
+            except OSError:
+                pass
+    return os.pathsep.join(parts)
+
+
+def find_mpv():
+    """mpv = décodage GPU (D3D11VA) + profil faible latence. ffplay en secours.
+    Ordre : variable ORBIT_MPV, PATH (relu dans le registre), dossiers d'installation courants."""
+    import shutil
+    forced = os.environ.get("ORBIT_MPV")
+    if forced and Path(forced).is_file():
+        return forced
+    found = shutil.which("mpv", path=_fresh_path())
+    if found:
+        return found
+    env = os.environ.get
+    candidates = []
+    for base in (env("ProgramFiles", r"C:\Program Files"), env("ProgramFiles(x86)", ""),
+                 env("LOCALAPPDATA", ""), env("LOCALAPPDATA", "") and str(Path(env("LOCALAPPDATA")) / "Programs")):
+        if base:
+            candidates += [Path(base) / "mpv" / "mpv.exe", Path(base) / "MPV Player" / "mpv.exe"]
+    if env("USERPROFILE"):
+        candidates.append(Path(env("USERPROFILE")) / "scoop" / "apps" / "mpv" / "current" / "mpv.exe")
+    for c in candidates:
+        if c.is_file():
+            return str(c)
+    # winget en mode "portable" : %LOCALAPPDATA%\Microsoft\WinGet\Packages\shinchiro.mpv_...\mpv.exe
+    pkgs = Path(env("LOCALAPPDATA", "")) / "Microsoft" / "WinGet" / "Packages"
+    if pkgs.is_dir():
+        for d in pkgs.glob("*mpv*"):
+            hits = list(d.rglob("mpv.exe"))
+            if hits:
+                return str(hits[0])
+    return None
+
+
+def player_command(video_cfg, port, title, fullscreen):
+    """Commande du lecteur + nom du lecteur. Le portable ÉCOUTE, le fixe envoie."""
+    if video_cfg.get("transport") == "srt":
+        lat_us = int(video_cfg.get("srt_latency_ms", 40)) * 1000
+        url = f"srt://0.0.0.0:{port}?mode=listener&latency={lat_us}&transtype=live"
+    else:
+        url = f"udp://0.0.0.0:{port}?fifo_size=5000000&overrun_nonfatal=1&buffer_size=8388608"
+    mpv = find_mpv()
+    if mpv:
+        return [
+            mpv, "--no-config", f"--input-conf={HERE / 'mpv-input.conf'}",
+            "--profile=low-latency",            # pas d'interpolation, tampons minimaux
+            "--untimed",                        # affiche chaque image dès qu'elle est décodée
+            "--no-cache", "--hwdec=auto-safe",  # décodage par la carte graphique
+            "--demuxer-lavf-o-add=fflags=+nobuffer", "--demuxer-lavf-analyzeduration=0.1",
+            "--no-audio", "--osc=no", "--osd-level=0", "--force-window=immediate",
+            f"--title={title}",
+            *(["--fs"] if fullscreen else ["--geometry=1280x720"]),
+            url,
+        ], "mpv"
+    return [
+        "ffplay", "-hide_banner", "-loglevel", "error", "-window_title", title,
+        "-fflags", "nobuffer", "-flags", "low_delay", "-probesize", "32",
+        "-analyzeduration", "0", "-framedrop", "-vf", "setpts=0", "-f", "mpegts",
+        *(["-fs"] if fullscreen else ["-x", "1280", "-y", "720"]), url,
+    ], "ffplay"
+
+
 # ======================================================== Wake-on-LAN
 def wake_on_lan(macs):
     """Paquet magique : 6 x FF puis 16 x l'adresse MAC, en broadcast UDP (ports 9 et 7)."""
@@ -85,8 +162,8 @@ def ping_agent(h, timeout=1.5):
 
 
 # ======================================================== session
-STEP_NAMES = {"wake": "Réveil du PC fixe", "agent": "Connexion à l'agent",
-              "stream": "Ouverture du flux", "game": "Lancement du jeu"}
+STEP_NAMES = {"wake": "Réveil du PC fixe", "stream": "Ouverture du lecteur vidéo",
+              "agent": "Démarrage du flux sur le PC fixe", "game": "Lancement du jeu"}
 
 
 class Runner:
@@ -124,7 +201,7 @@ class Runner:
             game = next((g for g in games if g["id"] == game_id), None)
             if not game:
                 raise HTTPException(404, "jeu introuvable sur le PC fixe")
-        keys = ["wake", "agent", "stream"] + (["game"] if game else [])
+        keys = ["wake", "stream", "agent"] + (["game"] if game else [])
         with self.lock:
             self._reset()
             self.state.update(phase="starting", host_id=hid, host_name=h["name"], game=game,
@@ -165,25 +242,30 @@ class Runner:
         if self.stop_evt.is_set():
             return self._teardown(h)
 
-        # 2. session côté agent
+        # 2. lecteur vidéo d'abord : il doit écouter AVANT que le fixe commence à envoyer
+        self._step("stream", "active")
+        try:
+            cfg = agent.request("GET", "/config")
+        except Exception as e:
+            return self._fail("stream", f"configuration illisible : {getattr(e, 'detail', e)}")
+        ports, v = cfg["ports"], cfg["video"]
+        cmd, player = player_command(v, ports["video"], f"ORBIT – {h['name']}", fullscreen)
+        try:
+            self.procs["video"] = subprocess.Popen(cmd, cwd=HERE)
+        except FileNotFoundError:
+            return self._fail("stream", "aucun lecteur vidéo : installe mpv "
+                                        "(winget install --id shinchiro.mpv --exact)")
+
+        # 3. session côté agent
         self._step("agent", "active")
         try:
-            info = agent.request("POST", "/session/start")
+            agent.request("POST", "/session/start")
         except Exception as e:
             return self._fail("agent", f"l'agent a refusé : {getattr(e, 'detail', e)}")
-        ports, v = info["ports"], info["video"]
-        self._step("agent", "done", f"{v['codec'].upper()} · {v['bitrate_mbps']} Mbps · {v['fps']} fps")
+        self._step("agent", "done", f"{v['codec'].upper()} · {v['bitrate_mbps']} Mbps · {v['fps']} fps · "
+                                    f"{v.get('transport', 'udp').upper()}")
 
-        # 3. processus locaux
-        self._step("stream", "active")
         py = sys.executable.replace("pythonw.exe", "python.exe")
-        ffplay = [
-            "ffplay", "-hide_banner", "-loglevel", "error",
-            "-window_title", f"ORBIT – {h['name']}",
-            "-fflags", "nobuffer", "-flags", "low_delay", "-probesize", "32",
-            "-analyzeduration", "0", "-framedrop", "-vf", "setpts=0", "-f", "mpegts",
-        ] + (["-fs"] if fullscreen else ["-x", "1280", "-y", "720"]) + [
-            f"udp://0.0.0.0:{ports['video']}?fifo_size=5000000&overrun_nonfatal=1&buffer_size=8388608"]
         try:
             self.procs["audio"] = subprocess.Popen(
                 [py, str(HERE / "audio_receiver.py"), "--allow", h["host"], "--port", str(ports["audio"])],
@@ -191,11 +273,13 @@ class Runner:
             self.procs["input"] = subprocess.Popen(
                 [py, str(HERE / "input_sender.py"), h["host"], "--port", str(ports["input"])],
                 cwd=HERE, creationflags=NO_WINDOW)
-            self.procs["video"] = subprocess.Popen(ffplay, cwd=HERE)
         except FileNotFoundError as e:
-            return self._fail("stream", f"programme introuvable sur le portable : {e.filename} "
-                                        "(ffplay installé ? relance client_setup.ps1)")
-        self._step("stream", "done", f"{h['host']} → ce PC")
+            return self._fail("stream", f"programme introuvable : {e.filename}")
+        time.sleep(1.0)
+        if self.procs["video"].poll() is not None:
+            return self._fail("stream", f"{player} s'est fermé tout de suite "
+                                        "(transport SRT non pris en charge par ce lecteur ?)")
+        self._step("stream", "done", f"{player} · {'décodage GPU' if player == 'mpv' else 'décodage processeur'}")
 
         # 4. jeu
         if game:
@@ -288,6 +372,8 @@ class VideoPatch(BaseModel):
     bitrate_mbps: int | None = None
     codec: str | None = None
     scale: str | None = None
+    transport: str | None = None
+    srt_latency_ms: int | None = None
 
 
 app = FastAPI(title="ORBIT bridge")
@@ -298,6 +384,13 @@ pairings = {}
 @app.get("/health")
 def health():
     return {"ok": True, "pc": socket.gethostname()}
+
+
+@app.get("/player", dependencies=[Depends(auth)])
+def player():
+    mpv = find_mpv()
+    return {"name": "mpv" if mpv else "ffplay", "path": mpv,
+            "install_hint": None if mpv else "winget install --id shinchiro.mpv --exact"}
 
 
 @app.get("/hosts", dependencies=[Depends(auth)])
@@ -493,7 +586,7 @@ def main():
     TOKEN = args.token
     if args.parent_pid:
         threading.Thread(target=watch_parent, args=(args.parent_pid,), daemon=True).start()
-    uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="warning")
+    uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="warning", ws="none")
 
 
 if __name__ == "__main__":

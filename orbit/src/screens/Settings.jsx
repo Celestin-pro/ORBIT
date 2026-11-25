@@ -31,6 +31,10 @@ export default function Settings({ host, prefs, setPrefs, onRefreshGames, onChan
   const [video, setVideo] = useState(null);
   const [error, setError] = useState(null);
   const [confirmUnpair, setConfirmUnpair] = useState(false);
+  const [player, setPlayer] = useState(null);
+  useEffect(() => {
+    api("/player").then(setPlayer).catch(() => {});
+  }, []);
 
   const load = useCallback(async () => {
     try {
@@ -108,7 +112,23 @@ export default function Settings({ host, prefs, setPrefs, onRefreshGames, onChan
                 onChange={(scale) => patch({ scale })}
                 options={[["", "Native"], ["1920x1080", "1080p"], ["1280x720", "720p"]]}
               />
-              <p className="muted small">Wi-Fi faible : baisse le débit (10–15 Mbps) et passe en 720p.</p>
+              <Choice
+                label="Transport réseau"
+                value={video.transport || "udp"}
+                onChange={(transport) => patch({ transport })}
+                options={[["udp", "UDP · latence minimale"], ["srt", "SRT · corrige les pertes"]]}
+              />
+              {video.transport === "srt" && (
+                <Choice
+                  label="Fenêtre de correction SRT"
+                  value={video.srt_latency_ms}
+                  onChange={(srt_latency_ms) => patch({ srt_latency_ms })}
+                  options={[[20, "20 ms"], [40, "40 ms"], [80, "80 ms"], [120, "120 ms"]]}
+                />
+              )}
+              <p className="muted small">
+                Image qui se dégrade ou se fige : passe en SRT. Wi-Fi faible : baisse le débit (10–15 Mbps) et passe en 720p.
+              </p>
             </>
           )}
         </section>
@@ -121,6 +141,19 @@ export default function Settings({ host, prefs, setPrefs, onRefreshGames, onChan
             onChange={(fullscreen) => setPrefs({ ...prefs, fullscreen })}
             options={[[true, "Plein écran"], [false, "Fenêtrée"]]}
           />
+          <div className="setting">
+            <span className="setting-label">Lecteur vidéo</span>
+            {player?.name === "mpv" ? (
+              <span className="small">
+                <span className="status-dot on inline" aria-hidden="true" /> mpv · décodage par la carte graphique
+              </span>
+            ) : (
+              <span className="small">
+                <span className="status-dot off inline" aria-hidden="true" /> ffplay (décodage processeur, plus lent). Installe mpv :{" "}
+                <code>{player?.install_hint}</code>
+              </span>
+            )}
+          </div>
           <div className="setting">
             <span className="setting-label">Interface ORBIT</span>
             <div className="filters">

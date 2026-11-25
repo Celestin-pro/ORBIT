@@ -17,7 +17,12 @@ HTTPS avec empreinte épinglée, Wake-on-LAN.
    ```powershell
    python -m pip install -r requirements.txt
    ```
-2. **FFmpeg** (pour ffplay) : déjà installé lors des étapes précédentes.
+2. **mpv** (lecteur vidéo : décodage par la carte graphique, mode faible latence) :
+   ```powershell
+   winget install --id shinchiro.mpv --exact --source winget
+   ```
+   Sans mpv, ORBIT se rabat sur ffplay (décodage processeur, nettement plus de latence).
+   Paramètres > « Lecteur vidéo » indique celui qui est utilisé.
 3. **Node.js LTS** : `winget install OpenJS.NodeJS.LTS`
 4. **Rust + outils de compilation Microsoft** (pour Tauri) :
    ```powershell
@@ -70,7 +75,11 @@ Si `python` n'est pas dans le PATH : variable d'environnement `ORBIT_PYTHON` (ex
   s'ouvre dans la fenêtre de streaming (plein écran par défaut, réglable dans Paramètres).
   Ctrl+Alt+Shift+Z capture / rend le clavier et la souris.
 - **Fin** : ferme la fenêtre de streaming (Échap / Q) ou « Terminer la session ».
-- **Wi-Fi faible** : Paramètres > Débit 10–15 Mbps et Résolution 720p.
+- **Transport réseau** (Paramètres) :
+  - *UDP* : latence minimale, mais un paquet perdu abîme l'image jusqu'à l'image clé suivante.
+  - *SRT* : les paquets perdus sont redemandés pendant la « fenêtre de correction »
+    (40 ms par défaut). À choisir si l'image se dégrade ou se fige en Wi-Fi.
+- **Wi-Fi faible** : SRT + débit 10–15 Mbps + résolution 720p.
 
 ## Réveil à distance (Wake-on-LAN)
 
