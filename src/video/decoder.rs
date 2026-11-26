@@ -63,6 +63,15 @@ pub enum DecodeError {
     #[error("unité d'accès refusée par le décodeur : {0}")]
     UniteRefusee(String),
 
+    /// Le décodeur a accepté l'unité mais n'a pas pu en tirer une image intacte : erreur à la
+    /// sortie du décodage, ou image signalée corrompue (erreurs masquées par le décodeur).
+    ///
+    /// Récupérable : le flux se rétablit à l'image clé suivante. Une image corrompue a pu
+    /// être publiée quand même (mieux vaut une image légèrement abîmée qu'un gel) ; cette
+    /// erreur sert alors seulement au comptage des « erreurs de décodage ».
+    #[error("erreur de décodage : {0}")]
+    ImageDefectueuse(String),
+
     #[error("erreur du décodeur : {0}")]
     Autre(String),
 }
@@ -71,7 +80,12 @@ impl DecodeError {
     /// Vrai si l'on peut continuer à alimenter le décodeur après cette erreur
     /// (image perdue, mais pas de panne durable).
     pub fn est_recuperable(&self) -> bool {
-        matches!(self, DecodeError::PlusDEmplacement | DecodeError::UniteRefusee(_))
+        matches!(
+            self,
+            DecodeError::PlusDEmplacement
+                | DecodeError::UniteRefusee(_)
+                | DecodeError::ImageDefectueuse(_)
+        )
     }
 }
 
@@ -110,6 +124,7 @@ mod tests {
     fn seules_les_pertes_d_image_sont_recuperables() {
         assert!(DecodeError::PlusDEmplacement.est_recuperable());
         assert!(DecodeError::UniteRefusee("paquet tronqué".into()).est_recuperable());
+        assert!(DecodeError::ImageDefectueuse("macroblocs manquants".into()).est_recuperable());
         assert!(!DecodeError::SurfaceD3d11Indisponible("pas de d3d11va".into()).est_recuperable());
         assert!(
             !DecodeError::DecodeurIndisponible { codec: "HEVC".into(), cause: "absent".into() }

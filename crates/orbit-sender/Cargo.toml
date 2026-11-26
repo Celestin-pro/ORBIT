@@ -1,0 +1,27 @@
+[package]
+name = "orbit-sender"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Émetteur du protocole vidéo ORBIT (OVP v1) : lance ffmpeg, découpe, FEC, pacing, canal retour"
+license = "MIT"
+publish = false
+
+[dependencies]
+orbit-protocol = { path = "../orbit-protocol" }
+anyhow = "1.0"
+clap = { version = "4.6", features = ["derive"] }
+crossbeam-channel = "0.5"
+ctrlc = "3.4"
+env_logger = "0.11"
+log = "0.4"
+
+# Timer haute résolution et priorité du thread d'envoi (src/timer.rs, seul module unsafe).
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_Media",
+    "Win32_Security",
+    "Win32_System_Threading",
+]

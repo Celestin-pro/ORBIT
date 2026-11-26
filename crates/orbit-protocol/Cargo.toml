@@ -1,0 +1,19 @@
+[package]
+name = "orbit-protocol"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Protocole vidéo ORBIT (OVP v1) : paquets OV/OF, découpage, FEC Reed-Solomon, réassemblage"
+license = "MIT"
+publish = false
+
+[dependencies]
+# FEC Reed-Solomon en GF(2^8), Rust pur (sans la fonctionnalité simd-accel, qui compile du C).
+# Isolée derrière src/fec.rs : la matrice de cette crate fait partie du format (PROTOCOL.md).
+reed-solomon-erasure = { version = "6.0", default-features = false, features = ["std"] }
+thiserror = "2.0"
+
+[dev-dependencies]
+proptest = "1.5"
+# Exemple recv_stats : tampon de réception de 8 Mo (celui de Windows, 64 Ko, déborde).
+socket2 = "0.6"

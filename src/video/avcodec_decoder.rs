@@ -159,19 +159,37 @@ impl AvcodecD3d11Decoder {
         t_received: Instant,
         debut_decodage: Instant,
     ) -> Result<(), DecodeError> {
+        // Image publiée malgré des erreurs masquées : on le signale une fois toutes les images
+        // disponibles retirées, pour ne pas en laisser dans le décodeur.
+        let mut corrompue = None;
         loop {
             // SAFETY: `self.codec` est ouvert et `self.image` alloué ; avcodec_receive_frame
             // remplit l'image ou renvoie un AVERROR.
             let code = unsafe { ff::avcodec_receive_frame(self.codec, self.image) };
 
             if code == ff::AVERROR(ff::EAGAIN) || code == ff::AVERROR_EOF {
-                return Ok(());
+                return match corrompue {
+                    Some(detail) => Err(DecodeError::ImageDefectueuse(detail)),
+                    None => Ok(()),
+                };
             }
             if code < 0 {
-                return Err(DecodeError::Autre(format!(
+                // Le décodeur a pris le paquet mais n'en tire pas d'image : c'est une erreur
+                // de décodage (flux abîmé), pas une panne, et le flux reprendra.
+                return Err(DecodeError::ImageDefectueuse(format!(
                     "avcodec_receive_frame : {}",
                     message_erreur(code)
                 )));
+            }
+
+            // SAFETY: `self.image` contient une image valide après avcodec_receive_frame ; on
+            // ne lit que deux entiers de métadonnées.
+            let (drapeaux, erreurs) =
+                unsafe { ((*self.image).flags, (*self.image).decode_error_flags) };
+            if drapeaux & ff::AV_FRAME_FLAG_CORRUPT != 0 || erreurs != 0 {
+                corrompue = Some(format!(
+                    "image corrompue (erreurs masquées par le décodeur, drapeaux {erreurs:#x})"
+                ));
             }
 
             let resultat = self.publier_image(sortie, t_received, debut_decodage);
@@ -712,6 +730,7 @@ mod tests {
             ("video/lavf_source.rs", include_str!("lavf_source.rs")),
             ("render/nv12.rs", include_str!("../render/nv12.rs")),
             ("render/d3d11.rs", include_str!("../render/d3d11.rs")),
+            ("render/overlay.rs", include_str!("../render/overlay.rs")),
         ];
 
         for (nom, source) in sources {
