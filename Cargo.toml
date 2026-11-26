@@ -27,6 +27,11 @@ env_logger = "0.11"
 log = "0.4"
 thiserror = "2.0"
 
+# Protocole vidéo maison OVP v1 (PROTOCOL.md) : réassemblage, FEC, canal retour.
+orbit-protocol = { path = "crates/orbit-protocol" }
+# Tampon de réception UDP de 8 Mo pour OVP (celui de Windows, 64 Ko, déborde).
+socket2 = "0.6"
+
 # FFmpeg LGPL en DLL (règle 4 de CLAUDE.md) : bindings bruts, aucune compilation de FFmpeg
 # ici. La version majeure suit celle des DLL téléchargées par scripts/setup.ps1 (8.1), et
 # `FFMPEG_DIR` indique au build script où trouver en-têtes et .lib.

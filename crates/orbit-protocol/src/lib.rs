@@ -23,6 +23,7 @@ pub mod packet;
 pub mod reassembly;
 pub mod rng;
 pub mod seq;
+pub mod sps;
 
 /// Codec vidéo transporté (champ `codec` du paquet `"OV"`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

@@ -9,5 +9,6 @@ pub mod avcodec_decoder;
 pub mod decoder;
 pub mod frame;
 pub mod lavf_source;
+pub mod orbit_source;
 pub mod source;
 pub mod thread;

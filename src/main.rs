@@ -20,7 +20,7 @@ use anyhow::{Context, Result};
 use sdl3::event::{Event, WindowEvent};
 use sdl3::keyboard::{Keycode, Mod, Scancode};
 
-use crate::config::Config;
+use crate::config::{Config, OnLoss, Transport};
 use crate::render::d3d11::{Gpu, Pipeline, Presenter, RenderError, hwnd_de};
 use crate::render::letterbox::{Viewport, letterbox};
 use crate::render::nv12::Nv12Pool;
@@ -29,6 +29,7 @@ use crate::stats::{Echantillonneur, Stats};
 use crate::video::avcodec_decoder::AvcodecD3d11Decoder;
 use crate::video::frame::{DecodedFrame, Mailbox};
 use crate::video::lavf_source::LavfSource;
+use crate::video::orbit_source::{OrbitConfig, OrbitProtocolSource, PolitiquePerte};
 use crate::video::thread::VideoThread;
 
 /// Taille de la fenêtre au démarrage (16:9, confortable sur un portable 1080p).
@@ -128,16 +129,43 @@ fn executer() -> Result<()> {
     // Le drapeau d'arrêt sert aussi de rappel d'interruption à libavformat, ce qui rend la
     // fermeture immédiate même sur un socket silencieux.
     let arret_video = Arc::new(AtomicBool::new(false));
-    let url_video = config.url_video();
-    let arret_source = Arc::clone(&arret_video);
-    let mut thread_video = VideoThread::demarrer(
-        // Appelée à chaque tentative d'ouverture, tant que le flux n'est pas là.
-        move || LavfSource::ouvrir(&url_video, Arc::clone(&arret_source)),
-        Box::new(decodeur),
-        Arc::clone(&pool) as Arc<dyn crate::video::decoder::FrameSink>,
-        arret_video,
-        Arc::clone(&stats),
-    )
+    let sortie_video = Arc::clone(&pool) as Arc<dyn crate::video::decoder::FrameSink>;
+    let mut thread_video = match config.transport {
+        // Protocole maison OVP : réassemblage + FEC, sans libavformat.
+        Transport::Orbit => {
+            let config_ovp = OrbitConfig {
+                host: config.host,
+                video_port: config.video_port,
+                feedback_port: config.feedback_port,
+                politique: match config.on_loss {
+                    OnLoss::Freeze => PolitiquePerte::Figer,
+                    OnLoss::Show => PolitiquePerte::Montrer,
+                },
+                frame_lost_timeout_ms: config.frame_lost_timeout_ms,
+                simulate_loss_pct: config.simulate_loss,
+            };
+            VideoThread::demarrer(
+                move || OrbitProtocolSource::ouvrir(config_ovp.clone()),
+                Box::new(decodeur),
+                sortie_video,
+                arret_video,
+                Arc::clone(&stats),
+            )
+        }
+        // MPEG-TS sur UDP ou SRT, par libavformat.
+        Transport::Udp | Transport::Srt => {
+            let url_video = config.url_video();
+            let arret_source = Arc::clone(&arret_video);
+            VideoThread::demarrer(
+                // Appelée à chaque tentative d'ouverture, tant que le flux n'est pas là.
+                move || LavfSource::ouvrir(&url_video, Arc::clone(&arret_source)),
+                Box::new(decodeur),
+                sortie_video,
+                arret_video,
+                Arc::clone(&stats),
+            )
+        }
+    }
     .context("démarrage du thread vidéo")?;
 
     let mut pompe = sdl

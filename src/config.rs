@@ -17,6 +17,9 @@ pub enum Transport {
     Udp,
     /// MPEG-TS sur SRT ; le portable écoute (`mode=listener`), le PC fixe appelle.
     Srt,
+    /// Protocole vidéo maison OVP v1 (PROTOCOL.md) : FEC Reed-Solomon, pacing, canal retour.
+    /// Émetteur : `orbit-sender` sur le PC fixe.
+    Orbit,
 }
 
 impl fmt::Display for Transport {
@@ -24,6 +27,7 @@ impl fmt::Display for Transport {
         match self {
             Transport::Udp => f.write_str("udp"),
             Transport::Srt => f.write_str("srt"),
+            Transport::Orbit => f.write_str("orbit"),
         }
     }
 }
@@ -50,6 +54,25 @@ impl fmt::Display for Vsync {
         match self {
             Vsync::On => f.write_str("on"),
             Vsync::Off => f.write_str("off"),
+        }
+    }
+}
+
+/// Politique après une image perdue en transport `orbit` (`--on-loss`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "lower")]
+pub enum OnLoss {
+    /// Image figée jusqu'à la prochaine image clé, sans artefacts.
+    Freeze,
+    /// Continuer à décoder : artefacts possibles jusqu'à la prochaine image clé.
+    Show,
+}
+
+impl fmt::Display for OnLoss {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            OnLoss::Freeze => f.write_str("freeze"),
+            OnLoss::Show => f.write_str("show"),
         }
     }
 }
@@ -87,6 +110,24 @@ pub struct Config {
     #[arg(long, default_value_t = 40, value_name = "MS")]
     pub srt_latency_ms: u32,
 
+    /// Transport `orbit` : port du canal retour sur le PC fixe (HELLO, STATS, demandes
+    /// d'image clé).
+    #[arg(long, default_value_t = 5003, value_name = "PORT")]
+    pub feedback_port: u16,
+
+    /// Transport `orbit` : que faire après une image irrécupérable.
+    #[arg(long, default_value_t = OnLoss::Freeze)]
+    pub on_loss: OnLoss,
+
+    /// Transport `orbit` : délai avant de déclarer perdue une image incomplète, en ms.
+    #[arg(long, default_value_t = 20, value_name = "MS")]
+    pub frame_lost_timeout_ms: u32,
+
+    /// Transport `orbit` : pourcentage de paquets jetés volontairement à la réception
+    /// (tests de la FEC).
+    #[arg(long, default_value_t = 0.0, value_name = "PCT", value_parser = pourcentage)]
+    pub simulate_loss: f64,
+
     /// Démarrer en plein écran.
     #[arg(long)]
     pub fullscreen: bool,
@@ -112,6 +153,16 @@ pub struct Config {
     pub title: String,
 }
 
+/// Valide un pourcentage entre 0 et 100.
+fn pourcentage(texte: &str) -> Result<f64, String> {
+    let valeur: f64 = texte.parse().map_err(|_| format!("« {texte} » n'est pas un nombre"))?;
+    if (0.0..=100.0).contains(&valeur) {
+        Ok(valeur)
+    } else {
+        Err("doit être compris entre 0 et 100".to_owned())
+    }
+}
+
 /// Silence réseau au-delà duquel une lecture échoue, en microsecondes.
 ///
 /// Sans lui, une lecture UDP attend indéfiniment un paquet qui ne vient pas : le
@@ -131,6 +182,7 @@ impl Config {
     /// UDP : on écoute sur toutes les interfaces, avec un gros tampon noyau pour absorber
     /// les rafales d'un flux 1080p60.
     /// SRT : **le portable écoute** et le PC fixe appelle (`mode=listener`).
+    /// Orbit : pas d'URL libavformat ; l'adresse d'écoute, pour le journal.
     pub fn url_video(&self) -> String {
         match self.transport {
             Transport::Udp => format!(
@@ -145,6 +197,7 @@ impl Config {
                 // SRT exprime sa latence en microsecondes.
                 latence = u64::from(self.srt_latency_ms) * 1_000
             ),
+            Transport::Orbit => format!("ovp://0.0.0.0:{port}", port = self.video_port),
         }
     }
 }
@@ -206,6 +259,34 @@ mod tests {
         assert!(url.contains("latency=40000"));
         assert!(url.contains("transtype=live"));
         assert!(url.contains("&timeout=2000000"), "url = {url}");
+    }
+
+    #[test]
+    fn transport_orbit_et_ses_options() {
+        let config = config_minimale();
+        assert_eq!(config.feedback_port, 5003);
+        assert_eq!(config.on_loss, OnLoss::Freeze);
+        assert_eq!(config.frame_lost_timeout_ms, 20);
+        assert_eq!(config.simulate_loss, 0.0);
+
+        let config = Config::parse_from([
+            "orbit-player",
+            "--host",
+            "192.168.1.107",
+            "--transport",
+            "orbit",
+            "--on-loss",
+            "show",
+            "--simulate-loss",
+            "5",
+        ]);
+        assert_eq!(config.transport, Transport::Orbit);
+        assert_eq!(config.on_loss, OnLoss::Show);
+        assert_eq!(config.simulate_loss, 5.0);
+        assert_eq!(config.url_video(), "ovp://0.0.0.0:5000");
+
+        let trop = ["orbit-player", "--host", "192.168.1.107", "--simulate-loss", "150"];
+        assert!(Config::try_parse_from(trop).is_err());
     }
 
     #[test]

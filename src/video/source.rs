@@ -118,11 +118,7 @@ pub struct SourceStats {
 }
 
 impl SourceStats {
-    /// Ajoute une ligne « libellé : valeur ».
-    ///
-    /// `LavfSource` n'a rien à ajouter : seule une future source (protocole maison) s'en
-    /// servira, d'où l'exception au contrôle du code mort hors tests.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Ajoute une ligne « libellé : valeur » (utilisé par `OrbitProtocolSource`).
     pub fn ajouter(&mut self, libelle: impl Into<String>, valeur: impl Into<String>) {
         self.lignes.push((libelle.into(), valeur.into()));
     }
@@ -135,8 +131,8 @@ impl SourceStats {
 
 /// Fournisseur d'unités d'accès H.264/HEVC.
 ///
-/// Implémentations : `LavfSource` (v0.1, libavformat + MPEG-TS sur UDP/SRT), puis
-/// `OrbitProtocolSource` (protocole UDP maison).
+/// Implémentations : `LavfSource` (libavformat + MPEG-TS sur UDP/SRT) et
+/// `OrbitProtocolSource` (protocole UDP maison OVP, `--transport orbit`).
 pub trait VideoSource: Send {
     /// Caractéristiques du flux, dès qu'elles sont connues.
     fn stream_info(&self) -> Option<StreamInfo>;

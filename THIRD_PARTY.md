@@ -32,7 +32,9 @@ aucun code FFmpeg n'est incorporé dans l'exécutable.
 | `env_logger` | 0.11 | MIT OR Apache-2.0 |
 | `ffmpeg-sys-next` | 8.1 | WTFPL OR MIT (bindings ; FFmpeg lui-même reste LGPL) |
 | `log` | 0.4 | MIT OR Apache-2.0 |
+| `orbit-protocol` | 0.1 (ce dépôt, `crates/`) | MIT | protocole OVP ; ses dépendances sont listées plus bas |
 | `sdl3` (+ `sdl3-sys`) | 0.22 / 0.7 | MIT OR Apache-2.0 (bindings) ; SDL3 lui-même en Zlib |
+| `socket2` | 0.6 | MIT OR Apache-2.0 |
 | `thiserror` | 2.0 | MIT OR Apache-2.0 |
 | `windows` | 0.62 | MIT OR Apache-2.0 |
 
@@ -54,7 +56,7 @@ réellement (probablement pour le son).
 | ↳ `instant` | 0.1 | BSD-3-Clause | idem (permissive) |
 | `thiserror` | 2.0 | MIT OR Apache-2.0 | |
 | `proptest` | 1.x | MIT OR Apache-2.0 | tests uniquement (`dev-dependencies`) |
-| `socket2` | 0.6 | MIT OR Apache-2.0 | exemple `recv_stats` uniquement (`dev-dependencies`) |
+| `socket2` | 0.6 | MIT OR Apache-2.0 | exemple `recv_stats` (`dev-dependencies`) ; aussi dépendance directe du player (tampon de réception OVP) |
 
 `orbit-sender` (émetteur, PC fixe) : `orbit-protocol`, `anyhow`, `clap`, `env_logger`, `log`,
 `windows` (mêmes versions et licences que le player), plus :
