@@ -1,3 +1,8 @@
+# Workspace : le player reste le paquet racine ; les crates du protocole vidéo maison (OVP,
+# voir PROTOCOL.md) vivent dans crates/. Les profils ci-dessous s'appliquent à tout le workspace.
+[workspace]
+members = ["crates/*"]
+
 [package]
 name = "orbit-player"
 version = "0.1.0"

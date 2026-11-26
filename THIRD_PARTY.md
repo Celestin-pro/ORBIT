@@ -41,6 +41,32 @@ lettres vidéo est un `Mutex` + `Condvar`, et le thread vidéo se pilote par un 
 partagé avec le rappel d'interruption de FFmpeg. Il sera ajouté quand un canal servira
 réellement (probablement pour le son).
 
+## Crates du protocole vidéo maison (`crates/`)
+
+`orbit-protocol` (Rust pur, voir PROTOCOL.md) :
+
+| Crate | Version | Licence | Remarques |
+|---|---|---|---|
+| `reed-solomon-erasure` | 6.0 | MIT | FEC GF(2^8), sans `simd-accel` (qui compilerait du C) ; isolée derrière `fec.rs` |
+| ↳ `lru`, `spin`, `libm` | 0.7 / 0.9 / 0.2 | MIT | dépendances de `reed-solomon-erasure` |
+| ↳ `parking_lot` (+ `parking_lot_core`, `lock_api`) | 0.11 | MIT OR Apache-2.0 | idem |
+| ↳ `smallvec`, `hashbrown`, `ahash`, `scopeguard`, `cfg-if`, `getrandom`, `once_cell` | — | MIT OR Apache-2.0 | idem (transitives) |
+| ↳ `instant` | 0.1 | BSD-3-Clause | idem (permissive) |
+| `thiserror` | 2.0 | MIT OR Apache-2.0 | |
+| `proptest` | 1.x | MIT OR Apache-2.0 | tests uniquement (`dev-dependencies`) |
+| `socket2` | 0.6 | MIT OR Apache-2.0 | exemple `recv_stats` uniquement (`dev-dependencies`) |
+
+`orbit-sender` (émetteur, PC fixe) : `orbit-protocol`, `anyhow`, `clap`, `env_logger`, `log`,
+`windows` (mêmes versions et licences que le player), plus :
+
+| Crate | Version | Licence | Remarques |
+|---|---|---|---|
+| `crossbeam-channel` | 0.5 | MIT OR Apache-2.0 | canaux entre threads (`recv_timeout`, `is_empty`) |
+| `ctrlc` | 3.4 | MIT OR Apache-2.0 | arrêt propre sur Ctrl+C (tue ffmpeg) |
+
+ffmpeg n'est **pas** lié à `orbit-sender` : c'est un programme externe lancé en sous-processus
+(`--ffmpeg`), quel que soit son build.
+
 ## Vérification
 
 ```powershell
