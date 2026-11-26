@@ -596,7 +596,9 @@ dependencies = [
  "env_logger",
  "ffmpeg-sys-next",
  "log",
+ "orbit-protocol",
  "sdl3",
+ "socket2",
  "thiserror",
  "windows",
 ]
