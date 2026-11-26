@@ -1,7 +1,7 @@
 # orbit-player
 
 Récepteur de streaming du projet ORBIT, côté PC portable : il reçoit la vidéo du PC fixe
-(MPEG-TS H.264/HEVC en UDP ou SRT), la décode en D3D11VA sans jamais copier l'image vers le
+(protocole maison OVP avec `orbit-sender`, ou MPEG-TS H.264/HEVC en UDP ou SRT), la décode en D3D11VA sans jamais copier l'image vers le
 processeur, et l'affiche dans une seule fenêtre. Les entrées et le son viendront aux étapes
 suivantes (voir `CLAUDE.md`, qui décrit aussi l'architecture et les règles du projet).
 
@@ -25,6 +25,41 @@ Touches réservées (jamais envoyées à l'hôte) : **F3** overlay de stats, **F
 
 Journal : niveau `info` par défaut, `$env:ORBIT_LOG = "debug"` pour le détail (réception
 paquet par paquet résumée chaque seconde, tentatives de reconnexion).
+
+## Protocole maison OVP (`--transport orbit`)
+
+Avec `--transport orbit`, le player reçoit le protocole décrit dans `PROTOCOL.md` au lieu du
+MPEG-TS de ffmpeg : FEC Reed-Solomon (les paquets perdus sont reconstruits sans
+retransmission), pacing côté émetteur, et canal retour vers le PC fixe (HELLO, STATS toutes
+les 250 ms, demande d'image clé après une image irrécupérable). L'émetteur est
+`orbit-sender`, sur le PC fixe. Les modes `udp` (défaut) et `srt` restent disponibles.
+
+```powershell
+# PC fixe (règle de pare-feu UDP 5003 entrante nécessaire) :
+target\release\orbit-sender.exe --client 192.168.1.72 --bitrate-mbps 15 --fec-percent 20
+# PC portable :
+target\release\orbit-player.exe --host 192.168.1.107 --transport orbit
+```
+
+L'émetteur n'envoie rien tant qu'il n'a pas reçu le premier HELLO du player : l'ordre de
+lancement n'a pas d'importance. Options propres à ce transport : `--feedback-port 5003`,
+`--on-loss freeze|show` (image figée ou artefacts après une perte, jusqu'à l'image clé
+suivante), `--frame-lost-timeout-ms 20`, `--simulate-loss <pct>` (jette des paquets à la
+réception pour éprouver la FEC).
+
+Pour développer sans le PC fixe, tout sur le portable (mire, encodeur Intel) :
+
+```powershell
+cargo run --release -- --host 127.0.0.1 --transport orbit
+cargo run --release -p orbit-sender -- --client 127.0.0.1 --source test --encoder qsv
+```
+
+En OVP, l'overlay F3 ajoute : images ok / réparées par la FEC / perdues / en retard par
+seconde, fragments perdus (et taux), débit reçu, gigue, étalement à l'arrivée (premier
+fragment -> image complète : proche de la cible du pacing), nombre de demandes d'image clé,
+et, s'il y en a, paquets rejetés, paquets d'autres sources, débordements et pertes simulées.
+« Réception->écran » part ici de l'arrivée du **premier fragment** de l'image : l'attente du
+réassemblage est comprise.
 
 ## Ce que montre l'overlay F3
 

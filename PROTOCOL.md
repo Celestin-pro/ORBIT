@@ -241,6 +241,10 @@ lisibles par `ffplay`.
 --frame-lost-timeout-ms 20
 --simulate-loss <pct>        jette volontairement des paquets à la réception (tests)
 ```
+Implémenté par `src/video/orbit_source.rs` (`OrbitProtocolSource`, derrière le trait
+`VideoSource`). La résolution annoncée au décodeur est lue dans le SPS de la première image
+clé (`orbit_protocol::sps`). Le player envoie HELLO, STATS et KEYFRAME_REQUEST exactement
+comme `recv_stats`.
 
 ---
 
@@ -255,6 +259,12 @@ lisibles par `ffplay`.
 
 ## Évolutions prévues (hors v1)
 
+- **Débit adaptatif** : le player envoie déjà STATS toutes les 250 ms (images ok / FEC /
+  perdues, fragments reçus / perdus, gigue), ce qui suffit à piloter le débit côté sender
+  (viser ~80 % du débit sans perte). Il n'est pas fait en v1 : ffmpeg en ligne de commande ne
+  peut pas changer de débit en cours de route (il faudrait le relancer, avec une coupure et
+  une image clé à chaque palier). Il viendra avec l'encodage NVENC intégré (v2), qui change
+  de débit à chaud.
 - v2 : sender avec capture DXGI + NVENC intégrés → vraies images clés à la demande, invalidation
   de références, débit adaptatif piloté par STATS.
 - Chiffrement (ChaCha20-Poly1305) avec une clé de session fournie par l'agent.
