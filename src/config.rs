@@ -112,6 +112,19 @@ pub struct Config {
     pub title: String,
 }
 
+/// Silence réseau au-delà duquel une lecture échoue, en microsecondes.
+///
+/// Sans lui, une lecture UDP attend indéfiniment un paquet qui ne vient pas : le
+/// démultiplexeur n'est jamais remis à zéro et la reconnexion n'a jamais lieu. L'échec
+/// remonte en `SourceError::FluxInterrompu`, et le thread vidéo rouvre l'entrée.
+///
+/// Il passe par l'option `timeout` **de l'URL**, propre à chaque protocole : l'option
+/// générique `rw_timeout` est écrasée par `udp_open` (vérifié avec FFmpeg 8.1 : avec
+/// `-rw_timeout` seul, une entrée UDP muette bloque indéfiniment ; avec `?timeout=`, elle
+/// échoue). Côté SRT, `timeout` règle le même délai pour les lectures, mais pas l'attente
+/// de l'appelant en mode listener, qui reste illimitée (et interruptible).
+pub const DELAI_SILENCE_US: u64 = 2_000_000;
+
 impl Config {
     /// URL d'entrée pour libavformat, options basse latence incluses.
     ///
@@ -121,11 +134,13 @@ impl Config {
     pub fn url_video(&self) -> String {
         match self.transport {
             Transport::Udp => format!(
-                "udp://0.0.0.0:{port}?fifo_size=5000000&overrun_nonfatal=1&buffer_size=8388608",
+                "udp://0.0.0.0:{port}?fifo_size=5000000&overrun_nonfatal=1&buffer_size=8388608\
+                 &timeout={DELAI_SILENCE_US}",
                 port = self.video_port
             ),
             Transport::Srt => format!(
-                "srt://0.0.0.0:{port}?mode=listener&latency={latence}&transtype=live",
+                "srt://0.0.0.0:{port}?mode=listener&latency={latence}&transtype=live\
+                 &timeout={DELAI_SILENCE_US}",
                 port = self.video_port,
                 // SRT exprime sa latence en microsecondes.
                 latence = u64::from(self.srt_latency_ms) * 1_000
@@ -170,6 +185,8 @@ mod tests {
         assert!(url.contains("fifo_size=5000000"));
         assert!(url.contains("overrun_nonfatal=1"));
         assert!(url.contains("buffer_size=8388608"));
+        // Sans délai de silence, un flux coupé ne serait jamais détecté (voir DELAI_SILENCE_US).
+        assert!(url.contains("&timeout=2000000"), "url = {url}");
     }
 
     #[test]
@@ -188,6 +205,7 @@ mod tests {
         assert!(url.contains("mode=listener"));
         assert!(url.contains("latency=40000"));
         assert!(url.contains("transtype=live"));
+        assert!(url.contains("&timeout=2000000"), "url = {url}");
     }
 
     #[test]

@@ -14,8 +14,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::stats::Stats;
-use crate::video::decoder::{FrameSink, HwDecoder};
-use crate::video::source::{AccessUnit, SourceError, StreamInfo, VideoSource};
+use crate::video::decoder::{DecodeError, FrameSink, HwDecoder};
+use crate::video::source::{AccessUnit, SourceError, SourceStats, StreamInfo, VideoSource};
 
 /// Délai d'attente avant une nouvelle tentative d'ouverture après un échec.
 const DELAI_RECONNEXION: Duration = Duration::from_millis(500);
@@ -23,17 +23,24 @@ const DELAI_RECONNEXION: Duration = Duration::from_millis(500);
 /// Période du résumé périodique du journal.
 const PERIODE_RESUME: Duration = Duration::from_secs(1);
 
+/// Délai maximal accordé au thread pour s'arrêter. Au-delà, le programme se ferme quand
+/// même : une fermeture demandée par l'utilisateur ne doit jamais rester bloquée.
+const DELAI_ARRET: Duration = Duration::from_millis(1_500);
+
+/// Pourquoi le thread vidéo s'est arrêté de lui-même : message destiné à l'utilisateur.
+pub type ErreurFatale = String;
+
 /// Poignée sur le thread vidéo : la laisser tomber ne suffit pas, il faut appeler
 /// [`VideoThread::arreter`] pour que le thread sorte de son attente réseau.
 pub struct VideoThread {
-    poignee: Option<JoinHandle<()>>,
+    poignee: Option<JoinHandle<Result<(), ErreurFatale>>>,
     arret: Arc<AtomicBool>,
 }
 
 impl VideoThread {
-    /// Démarre le thread. `fabrique` est appelée *dans* le thread : l'ouverture de l'entrée
-    /// peut bloquer plusieurs centaines de millisecondes, et ne doit pas retarder
-    /// l'affichage de la fenêtre.
+    /// Démarre le thread. `fabrique` est appelée *dans* le thread, autant de fois que
+    /// nécessaire : l'ouverture de l'entrée peut bloquer (jusqu'à l'arrivée du flux, ou
+    /// jusqu'au délai de silence), et ne doit pas retarder l'affichage de la fenêtre.
     ///
     /// `arret` est partagé avec la source, qui s'en sert comme rappel d'interruption.
     pub fn demarrer<F, S>(
@@ -44,29 +51,70 @@ impl VideoThread {
         stats: Arc<Stats>,
     ) -> std::io::Result<Self>
     where
-        F: FnOnce() -> Result<S, SourceError> + Send + 'static,
+        F: FnMut() -> Result<S, SourceError> + Send + 'static,
         S: VideoSource + 'static,
     {
         let arret_thread = Arc::clone(&arret);
         let poignee = thread::Builder::new().name("orbit-video".to_owned()).spawn(move || {
             let mut decodeur = decodeur;
-            boucle(fabrique, decodeur.as_mut(), sortie.as_ref(), &arret_thread, &stats);
+            let resultat =
+                boucle(fabrique, decodeur.as_mut(), sortie.as_ref(), &arret_thread, &stats);
+            match &resultat {
+                Ok(()) => log::info!("Thread vidéo arrêté."),
+                Err(erreur) => log::error!("Thread vidéo arrêté sur erreur : {erreur}"),
+            }
+            resultat
         })?;
 
         Ok(Self { poignee: Some(poignee), arret })
     }
 
-    /// Demande l'arrêt et attend la fin du thread.
+    /// Si le thread s'est arrêté de lui-même (erreur fatale, panique), renvoie la raison.
     ///
-    /// Le drapeau partagé débloque `av_read_frame` par le rappel d'interruption : la sortie
-    /// est quasi immédiate, sans attendre un paquet qui ne viendra pas.
+    /// Non bloquant : le thread principal l'appelle à chaque tour de boucle pour fermer le
+    /// player avec un message clair plutôt que de laisser une fenêtre figée.
+    pub fn erreur_fatale(&mut self) -> Option<ErreurFatale> {
+        if !self.poignee.as_ref().is_some_and(JoinHandle::is_finished) {
+            return None;
+        }
+        let poignee = self.poignee.take()?;
+        Some(match poignee.join() {
+            Ok(Err(erreur)) => erreur,
+            Ok(Ok(())) => "le thread vidéo s'est arrêté sans qu'on le lui demande".to_owned(),
+            Err(_) => "le thread vidéo s'est terminé sur une panique".to_owned(),
+        })
+    }
+
+    /// Demande l'arrêt et attend la fin du thread, au plus [`DELAI_ARRET`].
+    ///
+    /// Le drapeau partagé débloque `av_read_frame` (et l'attente d'un appelant SRT) par le
+    /// rappel d'interruption : la sortie est normalement quasi immédiate. Si le thread reste
+    /// bloqué malgré tout (pilote, appel système), on le signale et on l'abandonne : il
+    /// disparaîtra avec le processus.
     pub fn arreter(mut self) {
+        self.arreter_dans_le_delai();
+    }
+
+    fn arreter_dans_le_delai(&mut self) {
         self.arret.store(true, Ordering::Relaxed);
-        if let Some(poignee) = self.poignee.take() {
-            // Un thread qui a paniqué est déjà fini : on ne propage pas, on journalise.
-            if poignee.join().is_err() {
-                log::error!("Le thread vidéo s'est terminé sur une panique.");
-            }
+        let Some(poignee) = self.poignee.take() else {
+            return;
+        };
+
+        let debut = Instant::now();
+        while !poignee.is_finished() && debut.elapsed() < DELAI_ARRET {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if !poignee.is_finished() {
+            log::error!(
+                "Le thread vidéo ne s'est pas arrêté en {} ms : fermeture sans l'attendre.",
+                DELAI_ARRET.as_millis()
+            );
+            return;
+        }
+        // Une panique ou une erreur fatale a déjà été journalisée par le thread lui-même.
+        if poignee.join().is_err() {
+            log::error!("Le thread vidéo s'est terminé sur une panique.");
         }
     }
 }
@@ -74,52 +122,71 @@ impl VideoThread {
 impl Drop for VideoThread {
     fn drop(&mut self) {
         // Filet de sécurité si `arreter` n'a pas été appelé (chemin d'erreur) : on lève le
-        // drapeau pour que le thread ne survive pas au programme.
-        self.arret.store(true, Ordering::Relaxed);
-        if let Some(poignee) = self.poignee.take()
-            && poignee.join().is_err()
-        {
-            log::error!("Le thread vidéo s'est terminé sur une panique.");
-        }
+        // drapeau pour que le thread ne survive pas au programme, sans bloquer plus que
+        // `arreter`.
+        self.arreter_dans_le_delai();
     }
+}
+
+/// Vrai si une nouvelle tentative d'ouverture a une chance d'aboutir : le PC fixe n'émet
+/// pas encore, s'est arrêté, ou relance ffmpeg. Un codec non pris en charge ou une panne
+/// interne, eux, ne s'arrangeront pas en réessayant.
+fn ouverture_a_retenter(erreur: &SourceError) -> bool {
+    matches!(
+        erreur,
+        SourceError::Ouverture { .. }
+            | SourceError::FluxVideoAbsent { .. }
+            | SourceError::FluxInterrompu(_)
+            | SourceError::PasDeDonnees
+    )
 }
 
 /// Boucle du thread vidéo : ouvrir, lire, journaliser, réouvrir si le flux se coupe.
 ///
-/// Aucun `unwrap` ni `panic!` (règle 6) : toute erreur est journalisée, et soit on réessaie,
-/// soit on sort.
+/// Renvoie `Ok` sur demande d'arrêt, `Err` avec un message lisible sur erreur fatale.
+/// Aucun `unwrap` ni `panic!` (règle 6).
 fn boucle<F, S>(
     fabrique: F,
     decodeur: &mut dyn HwDecoder,
     sortie: &dyn FrameSink,
     arret: &AtomicBool,
     stats: &Stats,
-) where
-    F: FnOnce() -> Result<S, SourceError>,
+) -> Result<(), ErreurFatale>
+where
+    F: FnMut() -> Result<S, SourceError>,
     S: VideoSource,
 {
     // Ouverture, avec réessais : au démarrage, le PC fixe n'émet pas forcément encore.
-    let mut source = match ouvrir_avec_reessais(fabrique, arret) {
-        Some(source) => source,
-        None => return,
+    let Some(mut source) = ouvrir_avec_reessais(fabrique, arret)? else {
+        return Ok(());
     };
 
     let mut info_courante = source.stream_info();
     if let Some(info) = info_courante {
         stats.enregistrer_resolution(info.width, info.height);
-        if let Err(erreur) = decodeur.configure(info, source.parameter_sets()) {
-            // Décodeur matériel indisponible : c'est fatal, et il faut le dire clairement
-            // (pas de repli logiciel silencieux).
-            log::error!("Configuration du décodeur impossible : {erreur}");
-            return;
-        }
+        // Décodeur matériel indisponible : c'est fatal, et il faut le dire clairement (pas
+        // de repli logiciel silencieux).
+        decodeur
+            .configure(info, source.parameter_sets())
+            .map_err(|erreur| format!("configuration du décodeur impossible : {erreur}"))?;
         log::info!("Décodeur : {}", decodeur.description());
     }
+    stats.publier_description(decodeur.description(), source.description());
 
     let mut unite = AccessUnit::vide();
     let mut journal = Journal::nouveau(info_courante);
+    let mut mesures_source = SourceStats::default();
+    let mut derniere_publication = Instant::now();
 
     while !arret.load(Ordering::Relaxed) {
+        // Une fois par seconde, hors du chemin critique : mesures propres à la source.
+        if derniere_publication.elapsed() >= PERIODE_RESUME {
+            derniere_publication = Instant::now();
+            mesures_source.vider();
+            source.source_stats(&mut mesures_source);
+            stats.publier_source_stats(&mesures_source);
+        }
+
         match source.next_access_unit(&mut unite) {
             Ok(()) if unite.est_vide() => {
                 // Le contrat de `VideoSource` autorise une unité vide ; elle n'apprend rien
@@ -127,7 +194,7 @@ fn boucle<F, S>(
                 log::debug!("Unité d'accès vide ignorée.");
             }
             Ok(()) => {
-                stats.compter_unite_recue();
+                stats.compter_unite_recue(unite.data.len());
                 journal.enregistrer(&unite);
 
                 // La source peut découvrir le flux après coup (premiers paquets avant la
@@ -139,23 +206,27 @@ fn boucle<F, S>(
                         log::info!("Flux : {} {}x{}", info.codec, info.width, info.height);
                         stats.enregistrer_resolution(info.width, info.height);
                         journal = Journal::nouveau(Some(info));
-                        if let Err(erreur) = decodeur.configure(info, source.parameter_sets()) {
-                            log::error!("Reconfiguration du décodeur impossible : {erreur}");
-                            return;
-                        }
+                        decodeur.configure(info, source.parameter_sets()).map_err(|erreur| {
+                            format!("reconfiguration du décodeur impossible : {erreur}")
+                        })?;
+                        stats.publier_description(decodeur.description(), source.description());
                     }
                 }
 
                 match decodeur.decode(&unite, sortie) {
                     Ok(()) => {}
+                    Err(erreur @ DecodeError::ImageDefectueuse(_)) => {
+                        // Flux abîmé (pertes réseau) : compté à part des unités refusées.
+                        stats.compter_erreur_decodage();
+                        log::debug!("Erreur de décodage : {erreur}");
+                    }
                     Err(erreur) if erreur.est_recuperable() => {
                         // Normal avant la première image clé, et après une perte de paquets.
                         stats.compter_unite_refusee();
                         log::debug!("Unité d'accès non décodée : {erreur}");
                     }
                     Err(erreur) => {
-                        log::error!("Erreur irrécupérable du décodeur : {erreur}");
-                        return;
+                        return Err(format!("erreur irrécupérable du décodeur : {erreur}"));
                     }
                 }
             }
@@ -168,66 +239,113 @@ fn boucle<F, S>(
                 // Les tampons du décodeur contiennent un état devenu faux : on les vide,
                 // le flux reprendra à la prochaine image clé.
                 decodeur.flush();
-                if !reconnecter(&mut source, arret) {
-                    return;
+                if !reconnecter(&mut source, arret)? {
+                    break;
                 }
+                stats.compter_reconnexion();
                 info_courante = source.stream_info();
                 if let Some(info) = info_courante {
                     stats.enregistrer_resolution(info.width, info.height);
                     journal = Journal::nouveau(Some(info));
-                    if let Err(erreur) = decodeur.configure(info, source.parameter_sets()) {
-                        log::error!("Reconfiguration du décodeur impossible : {erreur}");
-                        return;
-                    }
+                    decodeur.configure(info, source.parameter_sets()).map_err(|erreur| {
+                        format!("reconfiguration du décodeur impossible : {erreur}")
+                    })?;
+                    stats.publier_description(decodeur.description(), source.description());
                 }
             }
             Err(erreur) => {
-                log::error!("Erreur irrécupérable de la source vidéo : {erreur}");
-                return;
+                return Err(format!("erreur irrécupérable de la source vidéo : {erreur}"));
             }
         }
     }
 
     journal.resumer_maintenant("arrêt");
-    log::info!("Thread vidéo arrêté.");
+    Ok(())
 }
 
-/// Ouvre la source, en réessayant tant que l'arrêt n'est pas demandé.
-fn ouvrir_avec_reessais<F, S>(fabrique: F, arret: &AtomicBool) -> Option<S>
+/// Ouvre la source, en réessayant tant que l'arrêt n'est pas demandé et que l'erreur s'y
+/// prête (voir [`ouverture_a_retenter`]).
+///
+/// Renvoie `Ok(None)` si l'arrêt a été demandé avant l'ouverture, `Err` sur erreur fatale.
+/// Le premier échec est journalisé en avertissement, les suivants en débogage : un PC fixe
+/// éteint ne doit pas noyer le journal sous une ligne toutes les deux secondes.
+fn ouvrir_avec_reessais<F, S>(
+    mut fabrique: F,
+    arret: &AtomicBool,
+) -> Result<Option<S>, ErreurFatale>
 where
-    F: FnOnce() -> Result<S, SourceError>,
+    F: FnMut() -> Result<S, SourceError>,
     S: VideoSource,
 {
-    match fabrique() {
-        Ok(source) => Some(source),
-        Err(erreur) => {
-            if arret.load(Ordering::Relaxed) {
-                log::debug!("Ouverture de l'entrée abandonnée (arrêt demandé).");
-            } else {
-                log::error!("Ouverture de l'entrée vidéo impossible : {erreur}");
+    log::info!("Attente du flux vidéo…");
+    let mut echecs: u32 = 0;
+    loop {
+        if arret.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        match fabrique() {
+            Ok(source) => {
+                if echecs > 0 {
+                    log::info!("Entrée vidéo ouverte après {} tentative(s).", echecs + 1);
+                }
+                return Ok(Some(source));
             }
-            None
+            Err(_) if arret.load(Ordering::Relaxed) => {
+                log::debug!("Ouverture de l'entrée abandonnée (arrêt demandé).");
+                return Ok(None);
+            }
+            Err(erreur) if ouverture_a_retenter(&erreur) => {
+                echecs += 1;
+                if echecs == 1 {
+                    log::warn!(
+                        "Pas de flux vidéo ({erreur}) : nouvelle tentative toutes les {} ms.",
+                        DELAI_RECONNEXION.as_millis()
+                    );
+                } else {
+                    log::debug!("Ouverture, tentative {} : {erreur}", echecs + 1);
+                }
+                if !dormir_en_surveillant(DELAI_RECONNEXION, arret) {
+                    return Ok(None);
+                }
+            }
+            Err(erreur) => {
+                return Err(format!("ouverture de l'entrée vidéo impossible : {erreur}"));
+            }
         }
     }
 }
 
 /// Tente des réouvertures espacées jusqu'au succès, ou jusqu'à l'arrêt.
 ///
-/// Renvoie `false` si l'arrêt a été demandé entre-temps.
-fn reconnecter<S: VideoSource>(source: &mut S, arret: &AtomicBool) -> bool {
+/// Renvoie `Ok(false)` si l'arrêt a été demandé entre-temps, `Err` sur erreur fatale.
+fn reconnecter<S: VideoSource>(source: &mut S, arret: &AtomicBool) -> Result<bool, ErreurFatale> {
+    let mut echecs: u32 = 0;
     while !arret.load(Ordering::Relaxed) {
         match source.reconnect() {
-            Ok(()) => return true,
-            Err(erreur) => {
-                log::warn!("Réouverture impossible ({erreur}) : nouvelle tentative dans 500 ms.");
+            Ok(()) => {
+                log::info!("Flux vidéo rétabli après {} tentative(s).", echecs + 1);
+                return Ok(true);
+            }
+            Err(_) if arret.load(Ordering::Relaxed) => return Ok(false),
+            Err(erreur) if ouverture_a_retenter(&erreur) => {
+                echecs += 1;
+                if echecs == 1 {
+                    log::warn!(
+                        "Réouverture impossible ({erreur}) : nouvelle tentative toutes les {} ms.",
+                        DELAI_RECONNEXION.as_millis()
+                    );
+                } else {
+                    log::debug!("Réouverture, tentative {} : {erreur}", echecs + 1);
+                }
                 // Attente fractionnée : on reste réactif à la demande d'arrêt.
                 if !dormir_en_surveillant(DELAI_RECONNEXION, arret) {
-                    return false;
+                    return Ok(false);
                 }
             }
+            Err(erreur) => return Err(format!("réouverture de l'entrée impossible : {erreur}")),
         }
     }
-    false
+    Ok(false)
 }
 
 /// Dort au plus `duree`, en surveillant le drapeau d'arrêt. Renvoie `false` si l'arrêt a été
@@ -246,10 +364,12 @@ fn dormir_en_surveillant(duree: Duration, arret: &AtomicBool) -> bool {
     !arret.load(Ordering::Relaxed)
 }
 
-/// Journal des paquets reçus : détail à la trace, résumé chiffré une fois par seconde.
+/// Journal des paquets reçus : détail à la trace, résumé chiffré une fois par seconde en
+/// débogage (`ORBIT_LOG=debug`).
 ///
-/// C'est le livrable observable de l'étape 2 : il doit permettre de constater, sans
-/// décodeur, qu'un flux arrive et à quel débit.
+/// C'était le livrable observable de l'étape 2 : constater, sans décodeur, qu'un flux arrive
+/// et à quel débit. Depuis l'étape 4, le résumé de référence est la ligne `stats | ...` du
+/// thread principal, identique à l'overlay F3.
 struct Journal {
     info: Option<StreamInfo>,
     debut_fenetre: Instant,
@@ -327,7 +447,10 @@ impl Journal {
 
         let suffixe = if motif.is_empty() { String::new() } else { format!(" [{motif}]") };
 
-        log::info!(
+        // Niveau debug : le résumé `stats | ...` du thread principal donne déjà cadence et
+        // débit une fois par seconde, avec les mêmes chiffres que l'overlay. Cette ligne
+        // garde le détail propre à la réception (taille moyenne, images clés, PTS).
+        log::debug!(
             "réception{suffixe} : {cadence:.1} paquets/s, {debit_mbit:.2} Mbit/s, \
              {taille_moyenne} octets/paquet en moyenne, {} image(s) clé, {}, total {} paquets",
             self.images_cles,
@@ -361,6 +484,13 @@ mod tests {
     use crate::video::frame::{DecodedFrame, SlotIndex};
     use crate::video::source::VideoCodec;
     use std::sync::Mutex;
+
+    /// Fabrique qui fournit `source` à la première ouverture, puis échoue fatalement : la
+    /// boucle accepte une fabrique appelée plusieurs fois (réessais).
+    fn une_fois<S>(source: S) -> impl FnMut() -> Result<S, SourceError> {
+        let mut source = Some(source);
+        move || source.take().ok_or_else(|| SourceError::Autre("déjà ouverte".into()))
+    }
 
     /// Source factice : rejoue une liste de reponses, sans reseau ni FFmpeg.
     struct SourceFactice {
@@ -554,7 +684,8 @@ mod tests {
             Err(SourceError::CodecNonSupporte("fin du test".into())),
         ]);
 
-        boucle(|| Ok(source), &mut decodeur, &sortie, &arret, &stats);
+        let resultat = boucle(une_fois(source), &mut decodeur, &sortie, &arret, &stats);
+        assert!(resultat.is_err(), "la source factice finit sur une erreur fatale");
 
         assert_eq!(decodeur.configurations.lock().expect("verrou").len(), 1);
         // Les jeux de paramètres de la source sont bien arrivés au décodeur : sans eux, le
@@ -586,13 +717,43 @@ mod tests {
             Err(SourceError::CodecNonSupporte("fin du test".into())),
         ]);
 
-        boucle(|| Ok(source), &mut decodeur, &sortie, &arret, &stats);
+        let resultat = boucle(une_fois(source), &mut decodeur, &sortie, &arret, &stats);
+        assert!(resultat.is_err(), "la source factice finit sur une erreur fatale");
 
         let vue = stats.instantane();
         assert_eq!(vue.unites_recues, 2, "les deux unites ont bien ete recues");
         assert_eq!(vue.unites_refusees, 1);
         // La deuxieme a ete decodee : une unite refusee n'interrompt pas le flux.
         assert_eq!(*decodeur.decodes.lock().expect("verrou"), 1);
+    }
+
+    #[test]
+    fn une_image_defectueuse_est_comptee_a_part_des_unites_refusees() {
+        let arret = Arc::new(AtomicBool::new(false));
+        let stats = Arc::new(Stats::new());
+        let mut decodeur = DecodeurFactice::default();
+        *decodeur.prochaine_erreur.lock().expect("verrou") =
+            Some(DecodeError::ImageDefectueuse("macroblocs manquants".into()));
+        let sortie = SortieFactice::default();
+
+        let source = SourceFactice::nouvelle(vec![
+            Ok(vec![0_u8; 64]),
+            Ok(vec![0_u8; 64]),
+            Err(SourceError::CodecNonSupporte("fin du test".into())),
+        ]);
+        let resultat = boucle(une_fois(source), &mut decodeur, &sortie, &arret, &stats);
+        assert!(resultat.is_err(), "la source factice finit sur une erreur fatale");
+
+        let vue = stats.instantane();
+        assert_eq!(vue.erreurs_decodage, 1);
+        assert_eq!(vue.unites_refusees, 0);
+        assert_eq!(vue.octets_recus, 128);
+        // La boucle a continué : la deuxième unité a été décodée.
+        assert_eq!(*decodeur.decodes.lock().expect("verrou"), 1);
+        // Codec et transport sont publiés pour l'overlay.
+        let infos = stats.infos();
+        assert_eq!(infos.codec.as_deref(), Some("factice"));
+        assert_eq!(infos.transport.as_deref(), Some("factice://"));
     }
 
     #[test]
@@ -606,7 +767,8 @@ mod tests {
 
         // Pas de demande d'arret : si la boucle ne sortait pas seule, le test gelerait.
         let source = SourceFactice::nouvelle(vec![Ok(vec![0_u8; 64]), Ok(vec![0_u8; 64])]);
-        boucle(|| Ok(source), &mut decodeur, &sortie, &arret, &stats);
+        let resultat = boucle(une_fois(source), &mut decodeur, &sortie, &arret, &stats);
+        assert!(resultat.is_err(), "la source factice finit sur une erreur fatale");
 
         assert_eq!(*decodeur.decodes.lock().expect("verrou"), 0);
     }
@@ -624,7 +786,8 @@ mod tests {
         let sortie = SortieFactice::default();
 
         let source = SourceFactice::nouvelle(vec![Ok(vec![0_u8; 64])]);
-        boucle(|| Ok(source), &mut decodeur, &sortie, &arret, &stats);
+        let resultat = boucle(une_fois(source), &mut decodeur, &sortie, &arret, &stats);
+        assert!(resultat.is_err(), "la source factice finit sur une erreur fatale");
 
         assert_eq!(stats.instantane().unites_recues, 0);
         assert_eq!(*decodeur.decodes.lock().expect("verrou"), 0);
@@ -644,7 +807,8 @@ mod tests {
             Err(SourceError::CodecNonSupporte("fin du test".into())),
         ]);
 
-        boucle(|| Ok(source), &mut decodeur, &sortie, &arret, &stats);
+        let resultat = boucle(une_fois(source), &mut decodeur, &sortie, &arret, &stats);
+        assert!(resultat.is_err(), "la source factice finit sur une erreur fatale");
 
         assert_eq!(*decodeur.vidages.lock().expect("verrou"), 1, "flush apres l'interruption");
         assert_eq!(*decodeur.decodes.lock().expect("verrou"), 2);
@@ -663,27 +827,159 @@ mod tests {
             Err(SourceError::CodecNonSupporte("fin du test".into())),
         ]);
 
-        boucle(|| Ok(source), &mut decodeur, &sortie, &arret, &stats);
+        let resultat = boucle(une_fois(source), &mut decodeur, &sortie, &arret, &stats);
+        assert!(resultat.is_err(), "la source factice finit sur une erreur fatale");
         assert_eq!(stats.instantane().unites_recues, 1);
         assert_eq!(*decodeur.decodes.lock().expect("verrou"), 1);
     }
 
     #[test]
-    fn une_ouverture_impossible_termine_la_boucle_sans_paniquer() {
+    fn l_ouverture_est_retentee_jusqu_au_flux() {
+        // C'était le défaut de la v0.1 : un seul échec d'ouverture (PC fixe pas encore prêt)
+        // arrêtait le thread vidéo, et la fenêtre restait noire pour toujours.
         let arret = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(Stats::new());
         let mut decodeur = DecodeurFactice::default();
         let sortie = SortieFactice::default();
 
-        boucle::<_, SourceFactice>(
-            || Err(SourceError::Ouverture { url: "x://".into(), cause: "refus".into() }),
+        let mut tentatives = 0;
+        let mut source = Some(SourceFactice::nouvelle(vec![
+            Ok(vec![0_u8; 32]),
+            Err(SourceError::CodecNonSupporte("fin du test".into())),
+        ]));
+        let fabrique = || {
+            tentatives += 1;
+            if tentatives < 3 {
+                return Err(SourceError::Ouverture { url: "x://".into(), cause: "délai".into() });
+            }
+            source.take().ok_or_else(|| SourceError::Autre("déjà ouverte".into()))
+        };
+
+        let debut = Instant::now();
+        let resultat = boucle(fabrique, &mut decodeur, &sortie, &arret, &stats);
+        assert!(resultat.is_err(), "la source factice finit sur une erreur fatale");
+        assert_eq!(tentatives, 3, "deux échecs puis un succès");
+        assert!(debut.elapsed() >= DELAI_RECONNEXION * 2, "les tentatives sont espacées");
+        assert_eq!(stats.instantane().unites_recues, 1, "le flux a bien été lu après coup");
+    }
+
+    #[test]
+    fn une_erreur_fatale_a_l_ouverture_n_est_pas_retentee() {
+        let arret = Arc::new(AtomicBool::new(false));
+        let stats = Arc::new(Stats::new());
+        let mut decodeur = DecodeurFactice::default();
+        let sortie = SortieFactice::default();
+
+        let mut tentatives = 0;
+        let resultat = boucle::<_, SourceFactice>(
+            || {
+                tentatives += 1;
+                Err(SourceError::CodecNonSupporte("av1".into()))
+            },
             &mut decodeur,
             &sortie,
             &arret,
             &stats,
         );
-        assert_eq!(stats.instantane().unites_recues, 0);
+        assert_eq!(tentatives, 1);
+        let message = resultat.expect_err("un codec non pris en charge est fatal");
+        assert!(message.contains("av1"), "message peu clair : {message}");
         assert!(decodeur.configurations.lock().expect("verrou").is_empty());
+    }
+
+    #[test]
+    fn l_arret_interrompt_les_tentatives_d_ouverture() {
+        let arret = Arc::new(AtomicBool::new(false));
+        let stats = Arc::new(Stats::new());
+
+        let arret_boucle = Arc::clone(&arret);
+        let fil = thread::spawn(move || {
+            let mut decodeur = DecodeurFactice::default();
+            let sortie = SortieFactice::default();
+            boucle::<_, SourceFactice>(
+                || Err(SourceError::Ouverture { url: "x://".into(), cause: "délai".into() }),
+                &mut decodeur,
+                &sortie,
+                &arret_boucle,
+                &stats,
+            )
+        });
+
+        thread::sleep(Duration::from_millis(100));
+        let debut = Instant::now();
+        arret.store(true, Ordering::Relaxed);
+        let resultat = fil.join().expect("la boucle doit se terminer");
+        assert_eq!(resultat, Ok(()), "un arrêt demandé n'est pas une erreur");
+        assert!(debut.elapsed() < Duration::from_millis(500), "arrêt trop lent");
+    }
+
+    #[test]
+    fn une_reouverture_reussie_est_comptee() {
+        let arret = Arc::new(AtomicBool::new(false));
+        let stats = Arc::new(Stats::new());
+        let mut decodeur = DecodeurFactice::default();
+        let sortie = SortieFactice::default();
+
+        let source = SourceFactice::nouvelle(vec![
+            Ok(vec![0_u8; 64]),
+            Err(SourceError::FluxInterrompu("délai de silence".into())),
+            Ok(vec![0_u8; 64]),
+            Err(SourceError::CodecNonSupporte("fin du test".into())),
+        ]);
+        let resultat = boucle(une_fois(source), &mut decodeur, &sortie, &arret, &stats);
+        assert!(resultat.is_err());
+        assert_eq!(stats.instantane().reconnexions, 1);
+    }
+
+    #[test]
+    fn le_thread_signale_son_erreur_fatale_et_s_arrete_dans_le_delai() {
+        let arret = Arc::new(AtomicBool::new(false));
+        let stats = Arc::new(Stats::new());
+        let source = SourceFactice::nouvelle(vec![Err(SourceError::CodecNonSupporte(
+            "codec inconnu".into(),
+        ))]);
+        let mut fil = VideoThread::demarrer(
+            une_fois(source),
+            Box::new(DecodeurFactice::default()),
+            Arc::new(SortieFactice::default()),
+            Arc::clone(&arret),
+            stats,
+        )
+        .expect("démarrage du thread");
+
+        let debut = Instant::now();
+        let erreur = loop {
+            if let Some(erreur) = fil.erreur_fatale() {
+                break erreur;
+            }
+            assert!(debut.elapsed() < Duration::from_secs(2), "erreur fatale jamais signalée");
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert!(erreur.contains("codec inconnu"), "{erreur}");
+        // Une fois l'erreur lue, l'arrêt est immédiat (plus rien à attendre).
+        let debut = Instant::now();
+        fil.arreter();
+        assert!(debut.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn un_thread_qui_s_arrete_normalement_ne_signale_rien() {
+        let arret = Arc::new(AtomicBool::new(false));
+        let source = SourceFactice::nouvelle(Vec::new());
+        let mut fil = VideoThread::demarrer(
+            une_fois(source),
+            Box::new(DecodeurFactice::default()),
+            Arc::new(SortieFactice::default()),
+            Arc::clone(&arret),
+            Arc::new(Stats::new()),
+        )
+        .expect("démarrage du thread");
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(fil.erreur_fatale(), None, "la source muette n'est pas une erreur");
+
+        let debut = Instant::now();
+        fil.arreter();
+        assert!(debut.elapsed() < DELAI_ARRET, "arrêt borné");
     }
 
     #[test]
@@ -699,7 +995,9 @@ mod tests {
             // Apres ses deux unites, la source factice renvoie PasDeDonnees sans fin :
             // seule la demande d'arret peut terminer la boucle.
             let source = SourceFactice::nouvelle(vec![Ok(vec![0_u8; 32]), Ok(vec![0_u8; 32])]);
-            boucle(|| Ok(source), &mut decodeur, &sortie, &arret_boucle, &stats_boucle);
+            let resultat =
+                boucle(une_fois(source), &mut decodeur, &sortie, &arret_boucle, &stats_boucle);
+            assert_eq!(resultat, Ok(()), "un arrêt demandé n'est pas une erreur");
         });
 
         thread::sleep(Duration::from_millis(100));
